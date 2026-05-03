@@ -15,32 +15,29 @@ using namespace std;
 const int TOTAL_VM_COUNT = 192;
 const int CONTAINER_SIZE = sizeof(long)*8;
 
-unsigned long checkSameVM(unsigned long pm1,unsigned long pm2){
-    return pm1 & pm2;
-}
-
+/*
 bool hasSameVM(unsigned long pm1,unsigned long pm2) {
     return checkSameVM(pm1,pm2) > 0;
-}
+}*/
 
 //Brian Kernighan Algorithm
-unsigned long countVMs(unsigned long pm){
+unsigned long countVMs(unsigned long vm){
     
     unsigned long count =0;
-    while(pm > 0){
-        pm = pm & (pm-1);   
+    while(vm > 0){
+        vm = vm & (vm-1);   
         count++;
     }
-    return count++;
+    return count;
 }
 
-/*  there should be only single '1' bit in vm
-    pm can have multiple '1' bits    
-*/
-unsigned long removeSpecificVM(unsigned long pm,unsigned long vm){
-    
-    return pm & (~vm);
-    
+//Brian Kernighan Algorithm with vector VMs
+unsigned long countVectorVMs(vector<unsigned long> vm){
+    unsigned long count =0;
+    for(int i=0;i<vm.size();i++){
+        count += countVMs(vm.at(i));
+    }
+    return count;
 }
 
 vector<unsigned long> idToVM(int id){
@@ -118,17 +115,13 @@ vector<unsigned long> bitwiseNotMs(vector<unsigned long> m1){
 
 vector<unsigned long> bitwiseSLMs(vector<unsigned long> m1, unsigned long shift) {
     vector<unsigned long> result = createEmptyM();
-
     int blockShift = shift / CONTAINER_SIZE;     // how many whole elements to shift
     int bitShift   = shift % CONTAINER_SIZE;     // remaining bit shift
 
-
     for (int i = m1.size() - 1; i >= 0; i--) {
-
-        if (i - blockShift < 0) continue;
-
+        if (i + blockShift >= m1.size()) continue;
         // Shift current block
-        result.at(i) |= (m1.at(i - blockShift) << bitShift);
+        result.at(i) |= (m1.at(i + blockShift) << bitShift);
         //result[i] |= m1[i - blockShift] << bitShift;
 
         // Handle carry from previous block
@@ -138,7 +131,24 @@ vector<unsigned long> bitwiseSLMs(vector<unsigned long> m1, unsigned long shift)
             result.at(i) |= (m1.at(i + blockShift+1) >> (CONTAINER_SIZE - bitShift));
         }
     }
+    return result;
+}
 
+vector<unsigned long> bitwiseSRMs(vector<unsigned long> m1, unsigned long shift) {
+    vector<unsigned long> result = createEmptyM();
+    int blockShift = shift / CONTAINER_SIZE;     // how many whole elements to shift
+    int bitShift   = shift % CONTAINER_SIZE;     // remaining bit shift
+
+    for (int i = 0; i < m1.size(); i++) {
+        if (i - blockShift < 0) continue;
+        // Shift current block
+        result.at(i) |= (m1.at(i - blockShift) >> bitShift);
+
+        // Handle carry from previous block
+        if ( bitShift != 0 && i - blockShift >0) {
+            result.at(i) |= (m1.at(i - blockShift-1) << (CONTAINER_SIZE - bitShift));
+        }
+    }
     return result;
 }
 
@@ -153,6 +163,19 @@ void printPM(vector<unsigned long> pm) {
     cout<<endl;
 }
 
+vector<unsigned long> checkSameVM(vector<unsigned long> pm1,vector<unsigned long> pm2){
+    //return pm1 & pm2;
+    return bitwiseAndMs(pm1,pm2);
+}
+
+/*  there should be only single '1' bit in vm
+    pm can have multiple '1' bits    
+*/
+vector<unsigned long> removeSpecificVM(vector<unsigned long> pm,vector<unsigned long> vm){
+    //return pm & (~vm);
+    return bitwiseAndMs(pm,bitwiseNotMs(vm));
+}
+
 /*
  Second case VM count > 64 so that its more than 1 number
  sizeof(long)   = 64
@@ -160,26 +183,16 @@ void printPM(vector<unsigned long> pm) {
  PM is a vector
  VM is a vector
 */
-
 int main()
 {
     vector<unsigned long> pm1 = createEmptyM();
     //vector<unsigned long> pm2 = createEmptyM();
     pm1 = bitwiseOrMs(pm1,idToVM(1));
-    //printPM(pm1);
-    pm1 = bitwiseOrMs(pm1,idToVM(63));
-    //printPM(pm1);
-    pm1 = bitwiseOrMs(pm1,idToVM(95));
-    //printPM(pm1);
-    pm1 = bitwiseOrMs(pm1,idToVM(126));
-    //printPM(pm1);
-    //pm1 = bitwiseOrMs(pm1,idToVM(150));
-    //printPM(pm1);
-    pm1 = bitwiseOrMs(pm1,idToVM(190));
+    pm1 = bitwiseOrMs(pm1,idToVM(65));
+    pm1 = bitwiseOrMs(pm1,idToVM(129));
     printPM(pm1);
-    //printPM(idToVM(63));
-    
-    printPM(bitwiseSLMs(pm1,2));
+    //cout<<countVectorVMs(pm1)<<endl;
+    //printPM(bitwiseSRMs(pm1,65));
     
     return 0;
 }
