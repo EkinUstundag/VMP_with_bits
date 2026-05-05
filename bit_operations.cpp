@@ -1,11 +1,3 @@
-/******************************************************************************
-
-Welcome to GDB Online.
-  GDB online is an online compiler and debugger tool for C, C++, Python, PHP, Ruby, 
-  C#, OCaml, VB, Perl, Swift, Prolog, Javascript, Pascal, COBOL, HTML, CSS, JS
-  Code, Compile, Run and Debug online from anywhere in world.
-
-*******************************************************************************/
 #include <stdio.h>
 #include <iostream>
 using namespace std;
@@ -43,15 +35,13 @@ unsigned long countVectorVMs(vector<unsigned long> vm){
 vector<unsigned long> idToVM(int id){
     
     vector<unsigned long> vm = {};
-    //my_list.push_back(40);    // Adds to end
-    //my_list.push_front(5);    // Adds to beginning
-    int totalChunks = std::ceil(TOTAL_VM_COUNT / CONTAINER_SIZE);
+    int totalChunks = std::ceil(TOTAL_VM_COUNT / CONTAINER_SIZE); // sorun olabilir
     int chunk= id / CONTAINER_SIZE ;
-    //Initialize an empty pm
+
     for(int i=0;i<totalChunks;i++){
         
         if( i == chunk){
-            int coord = id % (sizeof(long)*8);
+            int coord = id % CONTAINER_SIZE;
             unsigned long num = 1;
             num = num << coord;
             vm.insert(vm.begin(), num);
@@ -164,7 +154,6 @@ void printPM(vector<unsigned long> pm) {
 }
 
 vector<unsigned long> checkSameVM(vector<unsigned long> pm1,vector<unsigned long> pm2){
-    //return pm1 & pm2;
     return bitwiseAndMs(pm1,pm2);
 }
 
@@ -186,12 +175,18 @@ vector<unsigned long> removeSpecificVM(vector<unsigned long> pm,vector<unsigned 
 int main()
 {
     vector<unsigned long> pm1 = createEmptyM();
-    //vector<unsigned long> pm2 = createEmptyM();
     pm1 = bitwiseOrMs(pm1,idToVM(1));
     pm1 = bitwiseOrMs(pm1,idToVM(65));
     pm1 = bitwiseOrMs(pm1,idToVM(129));
     printPM(pm1);
-    //cout<<countVectorVMs(pm1)<<endl;
+    cout<<"countVectorVMs(pm1) = "<<countVectorVMs(pm1)<<endl;
+    
+    cout<<"checkSameVM(pm1,idToVM(1)) = "<<endl;
+    printPM(checkSameVM(pm1,idToVM(1)));
+    cout<<endl;
+    cout<<"removeSpecificVM(pm1,idToVM(1)) = "<<endl;
+    printPM(removeSpecificVM(pm1,idToVM(1)));
+    cout<<endl;
     //printPM(bitwiseSRMs(pm1,65));
     
     return 0;
