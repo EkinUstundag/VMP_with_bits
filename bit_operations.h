@@ -6,7 +6,7 @@ using namespace std;
 
 const int CONTAINER_SIZE = sizeof(long)*8;
 int TOTAL_VM_COUNT;
-vector<vector<unsigned long>> solution;
+
 
 int cpu_cap;
 int ram_cap;
@@ -14,10 +14,12 @@ int* vm_CPU_Req;
 int* vm_RAM_Req;
 string instanceName;
 
+int PmLowerBounds[600]={};
+int TOTAL_PM_COUNT;
 // These below will not be used, but can be useful later
 int* pm_CPU; //If PMs have different specs, this will be useful
 int* pm_RAM; //If PMs have different specs, this will be useful
-int TOTAL_PM_COUNT;
+
 
 unsigned long countVMs(unsigned long vm);
 unsigned long countVectorVMs(vector<unsigned long> vm);

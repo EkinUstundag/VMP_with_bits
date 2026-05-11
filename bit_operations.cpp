@@ -10,7 +10,7 @@
 
 #include <experimental/filesystem>
 namespace std {
-    namespace filesystem = experimental::filesystem;
+    namespace fs = experimental::filesystem;
 }
 //namespace fs = std::experimental/filesystem;
 
@@ -149,7 +149,7 @@ vector<unsigned long> bitwiseSRMs(vector<unsigned long> m1, unsigned long shift)
 */
 void printPM(vector<unsigned long> pm) {
     
-     for (unsigned long n : pm){
+    for (unsigned long n : pm){
         cout<<bitset<CONTAINER_SIZE>(n)<<" "; 
         //cout << format("{:b}",n ) << " ";
     }
@@ -169,6 +169,7 @@ vector<unsigned long> removeSpecificVM(vector<unsigned long> pm,vector<unsigned 
 }
 
 
+
 void readFile(ifstream &f){
     string s;
     //1st Line is File Name
@@ -178,7 +179,6 @@ void readFile(ifstream &f){
     getline(f, s);
     TOTAL_PM_COUNT = stoi(s);
     
-    TOTAL_PM_COUNT = 13; // theoretical minimum for VMP_A100
     //3rd Line is CPU cap
     getline(f, s);
     cpu_cap = stoi(s);  
@@ -203,7 +203,7 @@ void readFile(ifstream &f){
     }
 }
 
-void printSolution() {
+void printSolution(vector<vector<unsigned long>> solution) {
     
     cout<< "The solution is:" <<endl;
     for (vector<unsigned long> pm : solution){
@@ -211,13 +211,12 @@ void printSolution() {
     }
 }
 
-void initialSolution(){
+vector<vector<unsigned long>> initialSolution(){
     
-    solution = {};
+    vector<vector<unsigned long>> solution = {};
     for(int i=0;i<TOTAL_PM_COUNT;i++){
         solution.push_back(createEmptyM());
     }//Empty solution
-    
     int min = 0;
     int max = TOTAL_PM_COUNT - 1;
     // Initialize a random number generator
@@ -227,15 +226,15 @@ void initialSolution(){
     
     //randomly assign bits to PMs
     for(int i=0;i<TOTAL_VM_COUNT;i++){
-        // for every VM, i, choose a random PM, solution.at(distrib(gen)) 
+        // for every VM, i, choose a random PM, solution.at(distrib(gen))
         solution.at(distrib(gen)) = bitwiseOrMs(solution.at(distrib(gen)), idToVM(i));
     }
+    return solution;
 }
 
-void initialize(ifstream &f){
-    
+vector<vector<unsigned long>> initialize(ifstream &f){
     readFile(f);
-    initialSolution();
+    return initialSolution();
 }
 
 /* Her PM için HER VM gezmek çok gereksiz, Her VM için Her PM gezilebilir
@@ -275,9 +274,12 @@ void swapBits(vector<unsigned long> &pm1, vector<unsigned long> &pm2, int coord1
     moveBit(pm2,pm1,coord2);
 }
 
-void run(int epochCount){
-    
+void saveSolution(ofstream &file,string inputFileName,unsigned long fit){
+    file << inputFileName <<"," << fit << endl;
+}
 
+unsigned long run(vector<vector<unsigned long>> solution,int epochCount){
+        
         int pmMin = 0;
         int pmMax = TOTAL_PM_COUNT - 1;
         // Initialize a random number generator
@@ -290,38 +292,59 @@ void run(int epochCount){
         int vmMax = TOTAL_VM_COUNT - 1;
         // Random VM
         uniform_int_distribution<> vmDistr(vmMin, vmMax);
-
+    
+    unsigned long bestFit = fitnessFunction(solution);
     for(int i=0;i<epochCount;i++){
-
         vector<vector<unsigned long>> currentSolution(solution);
-        unsigned long bestSolution = fitnessFunction(solution);
-        if(bestSolution == 0)
+        if(bestFit == 0)
             break;
         swapBits(currentSolution.at(pmDistr(gen)),currentSolution.at(pmDistr(gen))
         ,vmDistr(gen),vmDistr(gen));
         
-        if ( fitnessFunction(currentSolution) < bestSolution ){
+        unsigned long currentFit = fitnessFunction(currentSolution);
+        if ( currentFit < bestFit ){
             vector<vector<unsigned long>> copy(currentSolution);
             solution = copy;
         }    
     }
+    return bestFit;
 }
 
-vector<string> openDataset(string path){
-    std::vector<std::string> file_list;
-    try {
-        if (filesystem::exists(path) && filesystem::is_directory(path)) {
-            for (const auto& entry : filesystem::directory_iterator(path)) {
-                // Add only regular files to the list
-                if (filesystem::is_regular_file(entry.path())) {
-                    file_list.push_back(entry.path().string());
+void openDataset(string path,int epochCount){
+    vector<string> file_list;
+    int counter=0;
+    ofstream outfile("output.txt");
+
+    for (const auto& folder : fs::directory_iterator(path)) {
+        if (fs::is_directory(folder)) {//free function instead of member
+            cout << "Processing folder: " << folder.path().filename() << "\n";
+
+            for (const auto& file : fs::directory_iterator(folder)) {
+                if (fs::is_regular_file(file)) {// free function instead of member
+                    //cout << "  File: " << file.path() << "\n";
+                    // open and process file 
+                    cout << " Processing  File: " << file.path() << "\n";
+                    ifstream f(file.path().string());
+                    if (!f.is_open()) {
+                            cerr << "Error opening the file!"<<file.path().string()<<endl;
+                            exit(1);
+                    }
+                    
+                    TOTAL_PM_COUNT = PmLowerBounds[counter];
+                    //create initial solution
+                    vector<vector<unsigned long>> solution = initialize(f);  
+                    unsigned long bestFit = run(solution, epochCount);
+                    saveSolution(outfile,file.path().string(),bestFit);
+                    f.close();
+                    counter++;
                 }
             }
         }
-    } catch (const filesystem::filesystem_error& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
     }
-    return file_list;
+    
+    
+    
+    outfile.close();
 }
 
 int main(int argc, char *argv[])
@@ -360,13 +383,33 @@ int main(int argc, char *argv[])
     // Close the file
     f.close();*/
 
-    std::string path = "./dataset/Instances/VMP_A100"; // Your target folder
+    ifstream infile("LowerBounds.txt");
+    string line;
+    int i=0;
+    while (getline(infile, line)) {
+        // Strip BOM from the first line
+        if (line.size() >= 3 && 
+            (unsigned char)line[0] == 0xEF && 
+            (unsigned char)line[1] == 0xBB && 
+            (unsigned char)line[2] == 0xBF) {
+            line = line.substr(3);
+        }
 
+        // Strip \r in case of Windows line endings
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
 
-    // Display the list
-    for (const auto& file : file_list) {
-        std::cout << file << std::endl;
+        if (!line.empty()) {
+            PmLowerBounds[i]= stoi(line);
+            i++;
+        }
     }
+
+    string path = "./dataset/Instances"; // Your target folder
+    openDataset(path,100);
+    // Display the list
+
 
     return 0;
 }
