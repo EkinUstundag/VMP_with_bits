@@ -7,6 +7,7 @@
 #include <sstream>
 #include <random>
 #include <iostream>
+#include <chrono>
 
 #include <experimental/filesystem>
 namespace std {
@@ -261,6 +262,7 @@ unsigned long fitnessFunction(vector<vector<unsigned long>> solution){
 Move a bit from source PM to dest PM
 */
 void moveBit(vector<unsigned long> &source, vector<unsigned long> &dest, int coord){
+    if(source == dest) return;
     vector<unsigned long> bit = idToVM(coord);
     source = removeSpecificVM(source,bit);
     dest = bitwiseOrMs(dest,bit);
@@ -270,6 +272,7 @@ void moveBit(vector<unsigned long> &source, vector<unsigned long> &dest, int coo
     Swap the bits of PMs
 */
 void swapBits(vector<unsigned long> &pm1, vector<unsigned long> &pm2, int coord1,int coord2){
+    if(pm1 == pm2) return;
     moveBit(pm1,pm2,coord1);
     moveBit(pm2,pm1,coord2);
 }
@@ -278,23 +281,27 @@ void saveSolution(ofstream &file,string inputFileName,unsigned long fit){
     file << inputFileName <<"," << fit << endl;
 }
 
-unsigned long run(vector<vector<unsigned long>> solution,int epochCount){
+// Runs for 5 seconds max
+unsigned long run(vector<vector<unsigned long>> solution){
         
-        int pmMin = 0;
-        int pmMax = TOTAL_PM_COUNT - 1;
-        // Initialize a random number generator
-        random_device rd;
-        mt19937 gen(rd());
-        // Random PM
-        uniform_int_distribution<> pmDistr(pmMin, pmMax);
-    
-        int vmMin = 0;
-        int vmMax = TOTAL_VM_COUNT - 1;
-        // Random VM
-        uniform_int_distribution<> vmDistr(vmMin, vmMax);
+    int pmMin = 0;
+    int pmMax = TOTAL_PM_COUNT - 1;
+    // Initialize a random number generator
+    random_device rd;
+    mt19937 gen(rd());
+    // Random PM
+    uniform_int_distribution<> pmDistr(pmMin, pmMax);
+
+    int vmMin = 0;
+    int vmMax = TOTAL_VM_COUNT - 1;
+    // Random VM
+    uniform_int_distribution<> vmDistr(vmMin, vmMax);
     
     unsigned long bestFit = fitnessFunction(solution);
-    for(int i=0;i<epochCount;i++){
+   
+    auto start = std::chrono::steady_clock::now();
+    auto limit = std::chrono::seconds(5);   
+    while ((std::chrono::steady_clock::now() - start) < limit) {
         vector<vector<unsigned long>> currentSolution(solution);
         if(bestFit == 0)
             break;
@@ -305,7 +312,7 @@ unsigned long run(vector<vector<unsigned long>> solution,int epochCount){
         if ( currentFit < bestFit ){
             vector<vector<unsigned long>> copy(currentSolution);
             solution = copy;
-        }    
+        } 
     }
     return bestFit;
 }
@@ -317,23 +324,19 @@ void openDataset(string path,int epochCount){
 
     for (const auto& folder : fs::directory_iterator(path)) {
         if (fs::is_directory(folder)) {//free function instead of member
-            cout << "Processing folder: " << folder.path().filename() << "\n";
-
+            //cout << "Processing folder: " << folder.path().filename() << "\n";
             for (const auto& file : fs::directory_iterator(folder)) {
                 if (fs::is_regular_file(file)) {// free function instead of member
-                    //cout << "  File: " << file.path() << "\n";
-                    // open and process file 
-                    cout << " Processing  File: " << file.path() << "\n";
+                    //cout << " Processing  File: " << file.path() << "\n";
                     ifstream f(file.path().string());
                     if (!f.is_open()) {
-                            cerr << "Error opening the file!"<<file.path().string()<<endl;
-                            exit(1);
-                    }
-                    
+                        cerr << "Error opening the file!"<<file.path().string()<<endl;
+                        exit(1);
+                    } 
                     TOTAL_PM_COUNT = PmLowerBounds[counter];
                     //create initial solution
                     vector<vector<unsigned long>> solution = initialize(f);  
-                    unsigned long bestFit = run(solution, epochCount);
+                    unsigned long bestFit = run(solution);
                     saveSolution(outfile,file.path().string(),bestFit);
                     f.close();
                     counter++;
@@ -341,9 +344,6 @@ void openDataset(string path,int epochCount){
             }
         }
     }
-    
-    
-    
     outfile.close();
 }
 
@@ -406,10 +406,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    string path = "./dataset/Instances"; // Your target folder
+    string path = "./dataset/Instances/VMP_A100"; // Your target folder
     openDataset(path,100);
-    // Display the list
-
 
     return 0;
 }
