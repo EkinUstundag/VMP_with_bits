@@ -1,5 +1,5 @@
-#ifndef bit_operations_h
-#define bit_operations_h
+#ifndef BIT_OPERATIONS_H_INCLUDED
+#define BIT_OPERATIONS_H_INCLUDED
 #include <string>
 #include <vector>
 using namespace std;
@@ -34,4 +34,4 @@ vector<unsigned long> bitwiseSRMs(vector<unsigned long> m1, unsigned long shift)
 void printPM(vector<unsigned long> pm);
 unsigned long checkSameVM(vector<unsigned long> pm1,vector<unsigned long> pm2);
 vector<unsigned long> removeSpecificVM(vector<unsigned long> pm,vector<unsigned long> vm);
-#endif
+#endif // BIT_OPERATIONS_H_INCLUDED
