@@ -12,6 +12,8 @@
 #include <experimental/filesystem>
 
 const int MAX=10;
+// When a move is worse than bestFit, accept it with this probability (exploration).
+const double WORSE_ACCEPT_PROBABILITY = 0.003;
 
 namespace std {
     namespace fs = experimental::filesystem;
@@ -172,8 +174,6 @@ vector<unsigned long> removeSpecificVM(vector<unsigned long> pm,vector<unsigned 
     return bitwiseAndMs(pm,bitwiseNotMs(vm));
 }
 
-
-
 void readFile(ifstream &f){
     string s;
     //1st Line is File Name
@@ -206,6 +206,59 @@ void readFile(ifstream &f){
         i++;
     }
 }
+//Dataset C has different format
+void readFileC(ifstream &f){
+    string s;
+    string s2;
+    
+    //1st Line is File Name
+    getline(f, s);
+    instanceName = s;
+    //2nd Line is 2 integers representing counts of 2 types of PMs
+    getline(f, s);
+    stringstream  stringStream(s);
+    getline(stringStream, s2, ',');
+    int pm1Count = stoi(s2);
+    getline(stringStream, s2, ',');
+    int pm2Count = stoi(s2);
+    TOTAL_PM_COUNT = pm1Count + pm2Count;
+
+    //3rd line is CPU & RAM caps of pm1s
+    getline(f, s);
+    stringstream  stringStream2(s);
+    getline(stringStream2, s2, ',');
+    int cpuCap1 = stoi(s2);
+    getline(stringStream2, s2, ',');
+    int ramCap1 = stoi(s2);
+    
+    //4th Line is CPU & RAM caps of pm2s
+    getline(f, s);
+    stringstream  stringStream3(s);
+    getline(stringStream3, s2, ',');
+    int cpuCap2 = stoi(s2);
+    getline(stringStream3, s2, ',');
+    int ramCap2 = stoi(s2);    
+
+    //5th Line is total VM count
+    getline(f, s);
+    TOTAL_VM_COUNT = stoi(s);
+
+    cpu_cap = cpuCap1 + cpuCap2;
+    vm_CPU_Req = new int[TOTAL_VM_COUNT];
+    vm_RAM_Req = new int[TOTAL_VM_COUNT];
+    
+    //array for cpu & ram caps of PMs
+
+    int i=0;
+    while (getline(f, s)){
+        stringstream  stringStream4(s);
+        getline(stringStream4, s2, ' ');
+        vm_CPU_Req[i]= stoi(s2);
+        getline(stringStream4, s2, ' ');
+        vm_RAM_Req[i]= stoi(s2);
+        i++;
+    }   
+}
 
 void printSolution(vector<vector<unsigned long>> solution) {
 
@@ -216,22 +269,17 @@ void printSolution(vector<vector<unsigned long>> solution) {
 }
 
 vector<vector<unsigned long>> initialSolution(){
+    const int chunkCount = (TOTAL_VM_COUNT + CONTAINER_SIZE - 1) / CONTAINER_SIZE;
+    vector<vector<unsigned long>> solution(
+        TOTAL_PM_COUNT, vector<unsigned long>(chunkCount, 0UL));
 
-    vector<vector<unsigned long>> solution = {};
-    for(int i=0;i<TOTAL_PM_COUNT;i++){
-        solution.push_back(createEmptyM());
-    }//Empty solution
-    int min = 0;
-    int max = TOTAL_PM_COUNT - 1;
-    // Initialize a random number generator
-    random_device rd;
-    mt19937 gen(rd());
-    uniform_int_distribution<> distrib(min, max);
+    mt19937 gen(random_device{}());
+    uniform_int_distribution<> distrib(0, TOTAL_PM_COUNT - 1);
 
-    //randomly assign bits to PMs
-    for(int i=0;i<TOTAL_VM_COUNT;i++){
-        // for every VM, i, choose a random PM, solution.at(distrib(gen))
-        solution.at(distrib(gen)) = bitwiseOrMs(solution.at(distrib(gen)), idToVM(i));
+    for (int vmId = 0; vmId < TOTAL_VM_COUNT; ++vmId) {
+        vector<unsigned long> &pm = solution[distrib(gen)];
+        const int chunk = vmId / CONTAINER_SIZE;
+        pm[chunk] |= (1UL << (vmId % CONTAINER_SIZE));
     }
     return solution;
 }
@@ -241,8 +289,6 @@ vector<vector<unsigned long>> initialize(ifstream &f){
     return initialSolution();
 }
 
-/* Her PM i�in HER VM gezmek �ok gereksiz, Her VM i�in Her PM gezilebilir
-*/
 static unsigned long pmExcessFitness(const vector<unsigned long> &pm) {
     int pmCpuUsage = 0;
     int pmRamUsage = 0;
@@ -250,7 +296,7 @@ static unsigned long pmExcessFitness(const vector<unsigned long> &pm) {
         unsigned long word = pm[chunk];
         while (word) {
 #if defined(__GNUC__) || defined(__clang__)
-            int bit = __builtin_ctzl(word);
+            int bit = __builtin_ctzl(word); //Index of the lowest set bit
 #else
             int bit = 0;
             while (((word >> bit) & 1UL) == 0) ++bit;
@@ -304,6 +350,7 @@ unsigned long run(vector<vector<unsigned long>> &solution){
     mt19937 gen(random_device{}());
     uniform_int_distribution<> pmDistr(0, TOTAL_PM_COUNT - 1);
     uniform_int_distribution<> vmDistr(0, TOTAL_VM_COUNT - 1);
+    uniform_real_distribution<> acceptDistr(0.0, 1.0);
 
     vector<unsigned long> pmFitness(solution.size());
     unsigned long bestFit = 0;
@@ -312,8 +359,8 @@ unsigned long run(vector<vector<unsigned long>> &solution){
         bestFit += pmFitness[i];
     }
 
-    auto start = std::chrono::steady_clock::now();
     auto limit = std::chrono::seconds(5);
+    auto start = std::chrono::steady_clock::now();
 
     while ((std::chrono::steady_clock::now() - start) < limit) {
         if (bestFit == 0) break;
@@ -332,7 +379,14 @@ unsigned long run(vector<vector<unsigned long>> &solution){
         unsigned long newPm2Fit = pmExcessFitness(solution[pm2Idx]);
         unsigned long currentFit = bestFit - oldPm1Fit - oldPm2Fit + newPm1Fit + newPm2Fit;
 
-        if (currentFit < bestFit) {
+        bool acceptMove = currentFit < bestFit;
+        //  probability to accept a move that is worse than bestFit
+        if (!acceptMove &&
+            acceptDistr(gen) < WORSE_ACCEPT_PROBABILITY) {
+            acceptMove = true;
+        }
+
+        if (acceptMove) {
             bestFit = currentFit;
             pmFitness[pm1Idx] = newPm1Fit;
             pmFitness[pm2Idx] = newPm2Fit;
@@ -373,8 +427,8 @@ void openDataset(string datasetPath){
                         while (bestFit != 0) {
                             TOTAL_PM_COUNT++;
                             if (solution.size() < static_cast<size_t>(TOTAL_PM_COUNT)) {
-                                solution.push_back(createEmptyM());
-                                //solution = initialSolution();
+                                //solution.push_back(createEmptyM());
+                                ssolution = initialSolution();
                             }
                             bestFit = run(solution);
                         }
