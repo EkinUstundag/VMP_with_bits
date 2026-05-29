@@ -8,13 +8,11 @@
 #include <random>
 #include <iostream>
 #include <chrono>
+#include <climits>
 
 #include <experimental/filesystem>
 
 const int MAX=10;
-// When a move is worse than bestFit, accept it with this probability (exploration).
-const double WORSE_ACCEPT_PROBABILITY = 0.003;
-
 namespace std {
     namespace fs = experimental::filesystem;
 }
@@ -137,7 +135,7 @@ vector<unsigned long> bitwiseSRMs(vector<unsigned long> m1, unsigned long shift)
     int blockShift = shift / CONTAINER_SIZE;     // how many whole elements to shift
     int bitShift   = shift % CONTAINER_SIZE;     // remaining bit shift
 
-    for (int i = 0; i < m1.size(); i++) {
+    for (unsigned long i = 0; i < m1.size(); i++) {
         if (i - blockShift < 0) continue;
         // Shift current block
         result.at(i) |= (m1.at(i - blockShift) >> bitShift);
@@ -210,7 +208,7 @@ void readFile(ifstream &f){
 void readFileC(ifstream &f){
     string s;
     string s2;
-    
+
     //1st Line is File Name
     getline(f, s);
     instanceName = s;
@@ -230,14 +228,14 @@ void readFileC(ifstream &f){
     int cpuCap1 = stoi(s2);
     getline(stringStream2, s2, ',');
     int ramCap1 = stoi(s2);
-    
+
     //4th Line is CPU & RAM caps of pm2s
     getline(f, s);
     stringstream  stringStream3(s);
     getline(stringStream3, s2, ',');
     int cpuCap2 = stoi(s2);
     getline(stringStream3, s2, ',');
-    int ramCap2 = stoi(s2);    
+    int ramCap2 = stoi(s2);
 
     //5th Line is total VM count
     getline(f, s);
@@ -246,7 +244,7 @@ void readFileC(ifstream &f){
     cpu_cap = cpuCap1 + cpuCap2;
     vm_CPU_Req = new int[TOTAL_VM_COUNT];
     vm_RAM_Req = new int[TOTAL_VM_COUNT];
-    
+
     //array for cpu & ram caps of PMs
 
     int i=0;
@@ -257,7 +255,7 @@ void readFileC(ifstream &f){
         getline(stringStream4, s2, ' ');
         vm_RAM_Req[i]= stoi(s2);
         i++;
-    }   
+    }
 }
 
 void printSolution(vector<vector<unsigned long>> solution) {
@@ -289,30 +287,71 @@ vector<vector<unsigned long>> initialize(ifstream &f){
     return initialSolution();
 }
 
-static unsigned long pmExcessFitness(const vector<unsigned long> &pm) {
-    int pmCpuUsage = 0;
-    int pmRamUsage = 0;
+static void pmResourceUsage(const vector<unsigned long> &pm, int &cpu, int &ram) {
+    cpu = 0;
+    ram = 0;
     for (size_t chunk = 0; chunk < pm.size(); ++chunk) {
         unsigned long word = pm[chunk];
         while (word) {
 #if defined(__GNUC__) || defined(__clang__)
-            int bit = __builtin_ctzl(word); //Index of the lowest set bit
+            int bit = __builtin_ctzl(word);
 #else
             int bit = 0;
             while (((word >> bit) & 1UL) == 0) ++bit;
 #endif
             int vmId = static_cast<int>(chunk) * CONTAINER_SIZE + bit;
             if (vmId < TOTAL_VM_COUNT) {
-                pmCpuUsage += vm_CPU_Req[vmId];
-                pmRamUsage += vm_RAM_Req[vmId];
+                cpu += vm_CPU_Req[vmId];
+                ram += vm_RAM_Req[vmId];
             }
             word &= word - 1;
         }
     }
-    int cpuExceed = pmCpuUsage - cpu_cap;
-    int ramExceed = pmRamUsage - ram_cap;
-    return static_cast<unsigned long>(
-        (cpuExceed > 0 ? cpuExceed : 0) * (ramExceed > 0 ? ramExceed : 0));
+}
+// 0 if either cpu or ram usage is < capacity
+static unsigned long pmExcessFromUsage(int cpu, int ram) {
+    int cpuExceed = cpu - cpu_cap;
+    int ramExceed = ram - ram_cap;
+    int cpuPenalty = (cpuExceed > 0 ? cpuExceed : 0);
+    int ramPenalty = (ramExceed > 0 ? ramExceed : 0);
+
+    if (cpuPenalty == 0) return static_cast<unsigned long>(ramPenalty);
+    if (ramPenalty == 0) return static_cast<unsigned long>(cpuPenalty);
+    return static_cast<unsigned long>(cpuPenalty * ramPenalty);
+}
+
+static unsigned long pmExcessFitness(const vector<unsigned long> &pm) {
+    int cpu = 0;
+    int ram = 0;
+    pmResourceUsage(pm, cpu, ram);
+    return pmExcessFromUsage(cpu, ram);
+}
+//Finds a 1 bit on a PM
+static int randomVmOnPm(const vector<unsigned long> &pm, mt19937 &gen) {
+    int vmCount = static_cast<int>(countVectorVMs(pm));
+    if (vmCount == 0) return -1;
+
+    uniform_int_distribution<> pick(0, vmCount - 1);
+    int target = pick(gen);
+    int seen = 0;
+    for (size_t chunk = 0; chunk < pm.size(); ++chunk) {
+        unsigned long word = pm[chunk];
+        while (word) {
+#if defined(__GNUC__) || defined(__clang__)
+            int bit = __builtin_ctzl(word);
+#else
+            int bit = 0;
+            while (((word >> bit) & 1UL) == 0) ++bit;
+#endif
+            int vmId = static_cast<int>(chunk) * CONTAINER_SIZE + bit;
+            if (vmId < TOTAL_VM_COUNT) {
+                if (seen == target) return vmId;
+                ++seen;
+            }
+            word &= word - 1;
+        }
+    }
+    return -1;
 }
 
 unsigned long fitnessFunction(vector<vector<unsigned long>> solution) {
@@ -344,74 +383,112 @@ void swapBits(vector<unsigned long> &pm1, vector<unsigned long> &pm2, int coord1
     moveBit(pm2,pm1,coord2);
 }
 
-// Runs for 5 seconds max
+// Guided local search: move VMs off overloaded PMs toward better destinations.
 unsigned long run(vector<vector<unsigned long>> &solution){
+    const int pmCount = TOTAL_PM_COUNT;
+    const int moveCandidates = 24;
+    const int stallLimit = 3000;
+
+    vector<int> pmCpu(pmCount);
+    vector<int> pmRam(pmCount);
+    vector<unsigned long> pmFitness(pmCount);
+    vector<int> overloaded;
+    overloaded.reserve(pmCount);
+
+    unsigned long bestFit = 0;
+    for (int i = 0; i < pmCount; ++i) {
+        pmResourceUsage(solution[i], pmCpu[i], pmRam[i]);
+        pmFitness[i] = pmExcessFromUsage(pmCpu[i], pmRam[i]);
+        bestFit += pmFitness[i];
+        if (pmFitness[i] > 0) overloaded.push_back(i);
+    }
+    if (bestFit == 0) return 0;
 
     mt19937 gen(random_device{}());
-    uniform_int_distribution<> pmDistr(0, TOTAL_PM_COUNT - 1);
-    uniform_int_distribution<> vmDistr(0, TOTAL_VM_COUNT - 1);
-    uniform_real_distribution<> acceptDistr(0.0, 1.0);
+    uniform_int_distribution<> pmDistr(0, pmCount - 1);
+    uniform_int_distribution<> destDistr(0, pmCount - 1);
 
-    vector<unsigned long> pmFitness(solution.size());
-    unsigned long bestFit = 0;
-    for (size_t i = 0; i < solution.size(); ++i) {
-        pmFitness[i] = pmExcessFitness(solution[i]);
-        bestFit += pmFitness[i];
-    }
-
+    int stalls = 0;
     auto limit = std::chrono::seconds(5);
     auto start = std::chrono::steady_clock::now();
 
-    while ((std::chrono::steady_clock::now() - start) < limit) {
-        if (bestFit == 0) break;
-
-        int pm1Idx = pmDistr(gen);
-        int pm2Idx = pmDistr(gen);
-        int vm1 = vmDistr(gen);
-        int vm2 = vmDistr(gen);
-
-        unsigned long oldPm1Fit = pmFitness[pm1Idx];
-        unsigned long oldPm2Fit = pmFitness[pm2Idx];
-
-        swapBits(solution[pm1Idx], solution[pm2Idx], vm1, vm2);
-
-        unsigned long newPm1Fit = pmExcessFitness(solution[pm1Idx]);
-        unsigned long newPm2Fit = pmExcessFitness(solution[pm2Idx]);
-        unsigned long currentFit = bestFit - oldPm1Fit - oldPm2Fit + newPm1Fit + newPm2Fit;
-
-        bool acceptMove = currentFit < bestFit;
-        //  probability to accept a move that is worse than bestFit
-        if (!acceptMove &&
-            acceptDistr(gen) < WORSE_ACCEPT_PROBABILITY) {
-            acceptMove = true;
+    while ((std::chrono::steady_clock::now() - start) < limit &&
+           bestFit > 0 && stalls < stallLimit) {
+        int src;
+        if (!overloaded.empty()) {
+            uniform_int_distribution<> ovDistr(0, static_cast<int>(overloaded.size()) - 1);
+            src = overloaded[ovDistr(gen)];
+        } else {
+            src = pmDistr(gen);
         }
 
-        if (acceptMove) {
-            bestFit = currentFit;
-            pmFitness[pm1Idx] = newPm1Fit;
-            pmFitness[pm2Idx] = newPm2Fit;
-        } else {
-            swapBits(solution[pm1Idx], solution[pm2Idx], vm1, vm2);
+        int vm = randomVmOnPm(solution[src], gen);
+        if (vm < 0) {
+            ++stalls;
+            continue;
+        }
+
+        unsigned long bestCandFit = ULONG_MAX;
+        int bestDst = -1;
+        for (int c = 0; c < moveCandidates; ++c) {
+            int dst = destDistr(gen);
+            if (dst == src) continue;
+
+            int newCpuSrc = pmCpu[src] - vm_CPU_Req[vm];
+            int newRamSrc = pmRam[src] - vm_RAM_Req[vm];
+            int newCpuDst = pmCpu[dst] + vm_CPU_Req[vm];
+            int newRamDst = pmRam[dst] + vm_RAM_Req[vm];
+
+            unsigned long newF1 = pmExcessFromUsage(newCpuSrc, newRamSrc);
+            unsigned long newF2 = pmExcessFromUsage(newCpuDst, newRamDst);
+            unsigned long candFit = bestFit - pmFitness[src] - pmFitness[dst] + newF1 + newF2;
+
+            if (candFit < bestCandFit) {
+                bestCandFit = candFit;
+                bestDst = dst;
+            }
+        }
+
+        if (bestDst < 0 || bestCandFit >= bestFit) {
+            ++stalls;
+            continue;
+        }
+
+        moveBit(solution[src], solution[bestDst], vm);
+        pmCpu[src] -= vm_CPU_Req[vm];
+        pmRam[src] -= vm_RAM_Req[vm];
+        pmCpu[bestDst] += vm_CPU_Req[vm];
+        pmRam[bestDst] += vm_RAM_Req[vm];
+
+        unsigned long oldSrcFit = pmFitness[src];
+        unsigned long oldDstFit = pmFitness[bestDst];
+        pmFitness[src] = pmExcessFromUsage(pmCpu[src], pmRam[src]);
+        pmFitness[bestDst] = pmExcessFromUsage(pmCpu[bestDst], pmRam[bestDst]);
+        bestFit = bestFit - oldSrcFit - oldDstFit + pmFitness[src] + pmFitness[bestDst];
+
+        stalls = 0;
+        overloaded.clear();
+        for (int i = 0; i < pmCount; ++i) {
+            if (pmFitness[i] > 0) overloaded.push_back(i);
         }
     }
     return bestFit;
 }
-
 
 void openDataset(string datasetPath){
     int counter=0;
     ofstream outputFile("outputQuality.csv");
 
     outputFile << "File Name" <<"," << "Total PM Used" <<"," << "Lower Bound" <<","
-    << "Solution Quality" <<"," << "Fitness(Excess CPUxRAM)" <<","<< "Elapsed Time(microseconds)" << endl;
+    << "Solution Quality" <<"," << "Fitness(Excess CPUxRAM)" <<","<< "Elapsed Time(nanoseconds)" << endl;
 
     for (const auto& folder : fs::directory_iterator(datasetPath)){
         if (fs::is_directory(folder)){
             //cout << "Processing folder: " << folder.path().filename() << "\n";
             for (const auto& file : fs::directory_iterator(folder)) {
+                //cout << " Processing  File: " << file.path() << "\n";
                 for(int i = 0; i < MAX; i++){ // to run same data file multiple times
                     if (fs::is_regular_file(file)) {// free function instead of member
-                        //cout << " Processing  File: " << file.path() << "\n";
                         ifstream f(file.path().string());
                         if (!f.is_open()) {
                             cerr << "Error opening the file!"<<file.path().string()<<endl;
@@ -420,15 +497,21 @@ void openDataset(string datasetPath){
 
                         //create initial solution
                         vector<vector<unsigned long>> solution = initialize(f);
-                        TOTAL_PM_COUNT = PmLowerBounds[counter];
+                        // TOTAL_PM_COUNT set in the file
+                        const int filePmCount = TOTAL_PM_COUNT;
+                        // File name
+                        string lbKey = file.path().stem().string();
+                        // Lowest Possible PM amount
+                        int lowerBound = PmLowerBounds.count(lbKey) ? PmLowerBounds[lbKey] : filePmCount;
+
+                        TOTAL_PM_COUNT = lowerBound;
                         std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
                         unsigned long bestFit = run(solution);
 
-                        while (bestFit != 0) {
+                        while (bestFit != 0 && TOTAL_PM_COUNT < filePmCount) {
                             TOTAL_PM_COUNT++;
                             if (solution.size() < static_cast<size_t>(TOTAL_PM_COUNT)) {
-                                //solution.push_back(createEmptyM());
-                                ssolution = initialSolution();
+                                solution = initialSolution();
                             }
                             bestFit = run(solution);
                         }
@@ -436,10 +519,10 @@ void openDataset(string datasetPath){
                         //Write out the Solution Quality
 
                         outputFile << file.path().string() <<","
-                            << TOTAL_PM_COUNT <<"," << PmLowerBounds[counter] <<","
-                            << 100 * (TOTAL_PM_COUNT / (double)PmLowerBounds[counter] - 1 ) <<","
+                            << TOTAL_PM_COUNT <<"," << lowerBound <<","
+                            << 100 * (TOTAL_PM_COUNT / (double)lowerBound - 1 ) <<","
                             << bestFit <<","
-                            << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count()  << endl;
+                            << std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()  << endl;
                         outputFile.flush();
 
                         f.close();
@@ -456,9 +539,15 @@ int main(int argc, char *argv[])
 {
 
     ifstream infile("LowerBounds.txt");
+    if (!infile.is_open()) {
+        cerr << "Error opening LowerBounds.txt" << endl;
+        return 1;
+    }
+    PmLowerBounds.clear();
+
     string line;
-    int i=0;
     while (getline(infile, line)) {
+        
         // Strip BOM from the first line
         if (line.size() >= 3 &&
             (unsigned char)line[0] == 0xEF &&
@@ -473,11 +562,17 @@ int main(int argc, char *argv[])
         }
 
         if (!line.empty()) {
-            PmLowerBounds[i]= stoi(line);
-            i++;
+            stringstream ss(line);
+            string fileName;
+            int lowerBound;
+            
+            if (ss >> fileName >> lowerBound) {
+                //fileName += ".vmp";
+                PmLowerBounds[fileName] = lowerBound;
+            }
+
         }
     }
-
     //openDataset(string(argv[1]),100);
     openDataset("./dataset/Instances/");
 
