@@ -172,6 +172,7 @@ vector<unsigned long> removeSpecificVM(vector<unsigned long> pm,vector<unsigned 
     return bitwiseAndMs(pm,bitwiseNotMs(vm));
 }
 
+//for reading A & B datasets
 void readFile(ifstream &f){
     string s;
     //1st Line is File Name
@@ -193,6 +194,12 @@ void readFile(ifstream &f){
 
     vm_CPU_Req = new int[TOTAL_VM_COUNT];
     vm_RAM_Req = new int[TOTAL_VM_COUNT];
+    pm_CPU = new int[TOTAL_PM_COUNT];
+    pm_RAM = new int[TOTAL_PM_COUNT];
+    for (int j = 0; j < TOTAL_PM_COUNT; ++j) {
+        pm_CPU[j] = cpu_cap;
+        pm_RAM[j] = ram_cap;
+    }
     int i=0;
     while (getline(f, s)){
         stringstream  stringStream(s);
@@ -204,7 +211,7 @@ void readFile(ifstream &f){
         i++;
     }
 }
-//Dataset C has different format
+//For reading C dataset
 void readFileC(ifstream &f){
     string s;
     string s2;
@@ -216,36 +223,44 @@ void readFileC(ifstream &f){
     getline(f, s);
     stringstream  stringStream(s);
     getline(stringStream, s2, ',');
-    int pm1Count = stoi(s2);
+    pmType1Count = stoi(s2);
     getline(stringStream, s2, ',');
-    int pm2Count = stoi(s2);
-    TOTAL_PM_COUNT = pm1Count + pm2Count;
+    pmType2Count = stoi(s2);
+    TOTAL_PM_COUNT = pmType1Count + pmType2Count;
 
     //3rd line is CPU & RAM caps of pm1s
     getline(f, s);
     stringstream  stringStream2(s);
     getline(stringStream2, s2, ',');
-    int cpuCap1 = stoi(s2);
+    cpu_cap = stoi(s2);
     getline(stringStream2, s2, ',');
-    int ramCap1 = stoi(s2);
+    ram_cap = stoi(s2);
 
     //4th Line is CPU & RAM caps of pm2s
     getline(f, s);
     stringstream  stringStream3(s);
     getline(stringStream3, s2, ',');
-    int cpuCap2 = stoi(s2);
+    cpu_cap2 = stoi(s2);
     getline(stringStream3, s2, ',');
-    int ramCap2 = stoi(s2);
+    ram_cap2 = stoi(s2);
 
     //5th Line is total VM count
     getline(f, s);
     TOTAL_VM_COUNT = stoi(s);
 
-    cpu_cap = cpuCap1 + cpuCap2;
     vm_CPU_Req = new int[TOTAL_VM_COUNT];
     vm_RAM_Req = new int[TOTAL_VM_COUNT];
 
-    //array for cpu & ram caps of PMs
+    pm_CPU = new int[TOTAL_PM_COUNT];
+    pm_RAM = new int[TOTAL_PM_COUNT];
+    for (int j = 0; j < pmType1Count; ++j) {
+        pm_CPU[j] = cpu_cap;
+        pm_RAM[j] = ram_cap;
+    }
+    for (int j = pmType1Count; j < TOTAL_PM_COUNT; ++j) {
+        pm_CPU[j] = cpu_cap2;
+        pm_RAM[j] = ram_cap2;
+    }
 
     int i=0;
     while (getline(f, s)){
@@ -282,8 +297,12 @@ vector<vector<unsigned long>> initialSolution(){
     return solution;
 }
 
-vector<vector<unsigned long>> initialize(ifstream &f){
-    readFile(f);
+vector<vector<unsigned long>> initialize(ifstream &f, bool isCDataset){
+    if (isCDataset) {
+        readFileC(f);
+    } else {
+        readFile(f);
+    }
     return initialSolution();
 }
 
@@ -309,9 +328,9 @@ static void pmResourceUsage(const vector<unsigned long> &pm, int &cpu, int &ram)
     }
 }
 // 0 if either cpu or ram usage is < capacity
-static unsigned long pmExcessFromUsage(int cpu, int ram) {
-    int cpuExceed = cpu - cpu_cap;
-    int ramExceed = ram - ram_cap;
+static unsigned long pmExcessFromUsage(int cpu, int ram, int pmIndex) {
+    int cpuExceed = cpu - pm_CPU[pmIndex];
+    int ramExceed = ram - pm_RAM[pmIndex];
     int cpuPenalty = (cpuExceed > 0 ? cpuExceed : 0);
     int ramPenalty = (ramExceed > 0 ? ramExceed : 0);
 
@@ -320,11 +339,11 @@ static unsigned long pmExcessFromUsage(int cpu, int ram) {
     return static_cast<unsigned long>(cpuPenalty * ramPenalty);
 }
 
-static unsigned long pmExcessFitness(const vector<unsigned long> &pm) {
+static unsigned long pmExcessFitness(const vector<unsigned long> &pm, int pmIndex) {
     int cpu = 0;
     int ram = 0;
     pmResourceUsage(pm, cpu, ram);
-    return pmExcessFromUsage(cpu, ram);
+    return pmExcessFromUsage(cpu, ram, pmIndex);
 }
 //Finds a 1 bit on a PM
 static int randomVmOnPm(const vector<unsigned long> &pm, mt19937 &gen) {
@@ -356,8 +375,8 @@ static int randomVmOnPm(const vector<unsigned long> &pm, mt19937 &gen) {
 
 unsigned long fitnessFunction(vector<vector<unsigned long>> solution) {
     unsigned long total = 0;
-    for (const vector<unsigned long> &pm : solution) {
-        total += pmExcessFitness(pm);
+    for (size_t i = 0; i < solution.size(); ++i) {
+        total += pmExcessFitness(solution[i], static_cast<int>(i));
     }
     return total;
 }
@@ -398,7 +417,7 @@ unsigned long run(vector<vector<unsigned long>> &solution){
     unsigned long bestFit = 0;
     for (int i = 0; i < pmCount; ++i) {
         pmResourceUsage(solution[i], pmCpu[i], pmRam[i]);
-        pmFitness[i] = pmExcessFromUsage(pmCpu[i], pmRam[i]);
+        pmFitness[i] = pmExcessFromUsage(pmCpu[i], pmRam[i], i);
         bestFit += pmFitness[i];
         if (pmFitness[i] > 0) overloaded.push_back(i);
     }
@@ -439,8 +458,8 @@ unsigned long run(vector<vector<unsigned long>> &solution){
             int newCpuDst = pmCpu[dst] + vm_CPU_Req[vm];
             int newRamDst = pmRam[dst] + vm_RAM_Req[vm];
 
-            unsigned long newF1 = pmExcessFromUsage(newCpuSrc, newRamSrc);
-            unsigned long newF2 = pmExcessFromUsage(newCpuDst, newRamDst);
+            unsigned long newF1 = pmExcessFromUsage(newCpuSrc, newRamSrc, src);
+            unsigned long newF2 = pmExcessFromUsage(newCpuDst, newRamDst, dst);
             unsigned long candFit = bestFit - pmFitness[src] - pmFitness[dst] + newF1 + newF2;
 
             if (candFit < bestCandFit) {
@@ -462,8 +481,8 @@ unsigned long run(vector<vector<unsigned long>> &solution){
 
         unsigned long oldSrcFit = pmFitness[src];
         unsigned long oldDstFit = pmFitness[bestDst];
-        pmFitness[src] = pmExcessFromUsage(pmCpu[src], pmRam[src]);
-        pmFitness[bestDst] = pmExcessFromUsage(pmCpu[bestDst], pmRam[bestDst]);
+        pmFitness[src] = pmExcessFromUsage(pmCpu[src], pmRam[src], src);
+        pmFitness[bestDst] = pmExcessFromUsage(pmCpu[bestDst], pmRam[bestDst], bestDst);
         bestFit = bestFit - oldSrcFit - oldDstFit + pmFitness[src] + pmFitness[bestDst];
 
         stalls = 0;
@@ -495,8 +514,11 @@ void openDataset(string datasetPath){
                             exit(1);
                         }
 
+                        const string filePath = file.path().string();
+                        const bool isCDataset = filePath.find('C') != string::npos;
+
                         //create initial solution
-                        vector<vector<unsigned long>> solution = initialize(f);
+                        vector<vector<unsigned long>> solution = initialize(f, isCDataset);
                         // TOTAL_PM_COUNT set in the file
                         const int filePmCount = TOTAL_PM_COUNT;
                         // File name
@@ -518,7 +540,7 @@ void openDataset(string datasetPath){
                         std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
                         //Write out the Solution Quality
 
-                        outputFile << file.path().string() <<","
+                        outputFile << lbKey <<","
                             << TOTAL_PM_COUNT <<"," << lowerBound <<","
                             << 100 * (TOTAL_PM_COUNT / (double)lowerBound - 1 ) <<","
                             << bestFit <<","
@@ -535,16 +557,8 @@ void openDataset(string datasetPath){
     outputFile.close();
 }
 
-int main(int argc, char *argv[])
-{
-
-    ifstream infile("LowerBounds.txt");
-    if (!infile.is_open()) {
-        cerr << "Error opening LowerBounds.txt" << endl;
-        return 1;
-    }
+void initializeLowerBounds(ifstream &infile){
     PmLowerBounds.clear();
-
     string line;
     while (getline(infile, line)) {
         
@@ -573,6 +587,18 @@ int main(int argc, char *argv[])
 
         }
     }
+}
+
+int main(int argc, char *argv[])
+{
+
+    ifstream infile("LowerBounds.txt");
+    if (!infile.is_open()) {
+        cerr << "Error opening LowerBounds.txt" << endl;
+        return 1;
+    }
+    
+    initializeLowerBounds(infile);
     //openDataset(string(argv[1]),100);
     openDataset("./dataset/Instances/");
 
