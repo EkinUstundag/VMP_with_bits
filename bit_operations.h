@@ -2,19 +2,25 @@
 #define BIT_OPERATIONS_H_INCLUDED
 #include <string>
 #include <vector>
+#include <map>
 using namespace std;
 
 const int CONTAINER_SIZE = sizeof(long)*8;
 int TOTAL_VM_COUNT;
 
-
 int cpu_cap;
 int ram_cap;
+int cpu_cap2;
+int ram_cap2;
+
+int pmType1Count;
+int pmType2Count;
+
 int* vm_CPU_Req;
 int* vm_RAM_Req;
 string instanceName;
 
-int PmLowerBounds[600]={};
+map<string, int> PmLowerBounds;
 int TOTAL_PM_COUNT;
 // These below will not be used, but can be useful later
 int* pm_CPU; //If PMs have different specs, this will be useful
