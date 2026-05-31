@@ -281,31 +281,6 @@ void printSolution(vector<vector<unsigned long>> solution) {
     }
 }
 
-vector<vector<unsigned long>> initialSolution(){
-    const int chunkCount = (TOTAL_VM_COUNT + CONTAINER_SIZE - 1) / CONTAINER_SIZE;
-    vector<vector<unsigned long>> solution(
-        TOTAL_PM_COUNT, vector<unsigned long>(chunkCount, 0UL));
-
-    mt19937 gen(random_device{}());
-    uniform_int_distribution<> distrib(0, TOTAL_PM_COUNT - 1);
-
-    for (int vmId = 0; vmId < TOTAL_VM_COUNT; ++vmId) {
-        vector<unsigned long> &pm = solution[distrib(gen)];
-        const int chunk = vmId / CONTAINER_SIZE;
-        pm[chunk] |= (1UL << (vmId % CONTAINER_SIZE));
-    }
-    return solution;
-}
-
-vector<vector<unsigned long>> initialize(ifstream &f, bool isCDataset){
-    if (isCDataset) {
-        readFileC(f);
-    } else {
-        readFile(f);
-    }
-    return initialSolution();
-}
-
 static void pmResourceUsage(const vector<unsigned long> &pm, int &cpu, int &ram) {
     cpu = 0;
     ram = 0;
@@ -327,24 +302,86 @@ static void pmResourceUsage(const vector<unsigned long> &pm, int &cpu, int &ram)
         }
     }
 }
-// 0 if either cpu or ram usage is < capacity
-static unsigned long pmExcessFromUsage(int cpu, int ram, int pmIndex) {
-    int cpuExceed = cpu - pm_CPU[pmIndex];
-    int ramExceed = ram - pm_RAM[pmIndex];
-    int cpuPenalty = (cpuExceed > 0 ? cpuExceed : 0);
-    int ramPenalty = (ramExceed > 0 ? ramExceed : 0);
+
+//returns the fitness for cpu & ram
+static unsigned long fitness(int cpu, int ram) {
+    int cpuPenalty = (cpu > 0 ? cpu : 0);
+    int ramPenalty = (ram > 0 ? ram : 0);
 
     if (cpuPenalty == 0) return static_cast<unsigned long>(ramPenalty);
     if (ramPenalty == 0) return static_cast<unsigned long>(cpuPenalty);
     return static_cast<unsigned long>(cpuPenalty * ramPenalty);
 }
 
-static unsigned long pmExcessFitness(const vector<unsigned long> &pm, int pmIndex) {
-    int cpu = 0;
-    int ram = 0;
-    pmResourceUsage(pm, cpu, ram);
-    return pmExcessFromUsage(cpu, ram, pmIndex);
+// Fitness function based on how much CPU/RAM exceeded in the PM
+static unsigned long fitnessFunction(int cpu, int ram, int pmIndex) {
+    int cpuExceed = cpu - pm_CPU[pmIndex];
+    int ramExceed = ram - pm_RAM[pmIndex];
+    return fitness(cpuExceed, ramExceed);
 }
+
+vector<vector<unsigned long>> initialSolution(){
+    const int chunkCount = (TOTAL_VM_COUNT + CONTAINER_SIZE - 1) / CONTAINER_SIZE;
+    vector<vector<unsigned long>> solution(
+        TOTAL_PM_COUNT, vector<unsigned long>(chunkCount, 0UL));
+    
+    //available CPU/RAM specs of PMs
+    vector<int> pmCpu(TOTAL_PM_COUNT, cpu_cap);
+    vector<int> pmRam(TOTAL_PM_COUNT, ram_cap);
+    
+    vector<int> pmOrder(TOTAL_PM_COUNT);
+    iota(pmOrder.begin(), pmOrder.end(), 0);    
+    
+    mt19937 gen(random_device{}());
+    uniform_int_distribution<> distrib(0, TOTAL_PM_COUNT - 1);
+
+    for (int vmId = 0; vmId < TOTAL_VM_COUNT; ++vmId) {
+        //area this VM covers
+        const unsigned long vmFitness = fitness(
+            vm_CPU_Req[vmId], vm_RAM_Req[vmId]);
+
+        //Sort PMs according to their fitness, ascending
+        sort(pmOrder.begin(), pmOrder.end(), [&](int a, int b) {
+            unsigned long fitA = fitness(pmCpu[a],
+                 pmRam[a]);
+            unsigned long fitB = fitness(pmCpu[b],
+                 pmRam[b]);
+            return fitA > fitB;
+        });
+
+        int assignedPm = -1;
+        for (int pmIdx : pmOrder) {
+            unsigned long pmFitness = fitness(pmCpu[pmIdx],
+                 pmRam[pmIdx]);
+            if (pmFitness >= vmFitness) {
+                assignedPm = pmIdx;
+                break;
+            }
+        }
+
+        if (assignedPm < 0) {
+            assignedPm = distrib(gen);
+        }
+
+        vector<unsigned long> &pm = solution[assignedPm];
+        const int chunk = vmId / CONTAINER_SIZE;
+        pm[chunk] |= (1UL << (vmId % CONTAINER_SIZE));
+        pmCpu[assignedPm] -= vm_CPU_Req[vmId];
+        pmRam[assignedPm] -= vm_RAM_Req[vmId];
+    }
+
+    return solution;
+}
+
+vector<vector<unsigned long>> initialize(ifstream &f, bool isCDataset){
+    if (isCDataset) {
+        readFileC(f);
+    } else {
+        readFile(f);
+    }
+    return initialSolution();
+}
+
 //Finds a 1 bit on a PM
 static int randomVmOnPm(const vector<unsigned long> &pm, mt19937 &gen) {
     int vmCount = static_cast<int>(countVectorVMs(pm));
@@ -371,14 +408,6 @@ static int randomVmOnPm(const vector<unsigned long> &pm, mt19937 &gen) {
         }
     }
     return -1;
-}
-
-unsigned long fitnessFunction(vector<vector<unsigned long>> solution) {
-    unsigned long total = 0;
-    for (size_t i = 0; i < solution.size(); ++i) {
-        total += pmExcessFitness(solution[i], static_cast<int>(i));
-    }
-    return total;
 }
 /*
 Move a bit from source PM to dest PM
@@ -408,8 +437,8 @@ unsigned long run(vector<vector<unsigned long>> &solution){
     const int moveCandidates = 24;
     const int stallLimit = 3000;
 
-    vector<int> pmCpu(pmCount);
-    vector<int> pmRam(pmCount);
+    vector<int> pmCpu(pmCount);//active CPU usages of PMs
+    vector<int> pmRam(pmCount);//active RAM usages of PMs
     vector<unsigned long> pmFitness(pmCount);
     vector<int> overloaded;
     overloaded.reserve(pmCount);
@@ -417,7 +446,7 @@ unsigned long run(vector<vector<unsigned long>> &solution){
     unsigned long bestFit = 0;
     for (int i = 0; i < pmCount; ++i) {
         pmResourceUsage(solution[i], pmCpu[i], pmRam[i]);
-        pmFitness[i] = pmExcessFromUsage(pmCpu[i], pmRam[i], i);
+        pmFitness[i] = fitnessFunction(pmCpu[i], pmRam[i], i);
         bestFit += pmFitness[i];
         if (pmFitness[i] > 0) overloaded.push_back(i);
     }
@@ -458,8 +487,8 @@ unsigned long run(vector<vector<unsigned long>> &solution){
             int newCpuDst = pmCpu[dst] + vm_CPU_Req[vm];
             int newRamDst = pmRam[dst] + vm_RAM_Req[vm];
 
-            unsigned long newF1 = pmExcessFromUsage(newCpuSrc, newRamSrc, src);
-            unsigned long newF2 = pmExcessFromUsage(newCpuDst, newRamDst, dst);
+            unsigned long newF1 = fitnessFunction(newCpuSrc, newRamSrc, src);
+            unsigned long newF2 = fitnessFunction(newCpuDst, newRamDst, dst);
             unsigned long candFit = bestFit - pmFitness[src] - pmFitness[dst] + newF1 + newF2;
 
             if (candFit < bestCandFit) {
@@ -481,8 +510,8 @@ unsigned long run(vector<vector<unsigned long>> &solution){
 
         unsigned long oldSrcFit = pmFitness[src];
         unsigned long oldDstFit = pmFitness[bestDst];
-        pmFitness[src] = pmExcessFromUsage(pmCpu[src], pmRam[src], src);
-        pmFitness[bestDst] = pmExcessFromUsage(pmCpu[bestDst], pmRam[bestDst], bestDst);
+        pmFitness[src] = fitnessFunction(pmCpu[src], pmRam[src], src);
+        pmFitness[bestDst] = fitnessFunction(pmCpu[bestDst], pmRam[bestDst], bestDst);
         bestFit = bestFit - oldSrcFit - oldDstFit + pmFitness[src] + pmFitness[bestDst];
 
         stalls = 0;
