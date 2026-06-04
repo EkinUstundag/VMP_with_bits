@@ -1,43 +1,63 @@
 #ifndef BIT_OPERATIONS_H_INCLUDED
 #define BIT_OPERATIONS_H_INCLUDED
+
+#include <fstream>
+#include <map>
 #include <string>
 #include <vector>
-#include <map>
-using namespace std;
 
-const int CONTAINER_SIZE = sizeof(long)*8;
-int TOTAL_VM_COUNT;
+constexpr int CONTAINER_SIZE = static_cast<int>(sizeof(unsigned long) * 8);
 
-int cpu_cap;
-int ram_cap;
-int cpu_cap2;
-int ram_cap2;
+// --- Problem instance (filled by readFile / readFileC) ---
+extern int TOTAL_VM_COUNT;
+extern int TOTAL_PM_COUNT;
 
-int pmType1Count;
-int pmType2Count;
+extern int cpu_cap;
+extern int ram_cap;
+extern int cpu_cap2;
+extern int ram_cap2;
 
-int* vm_CPU_Req;
-int* vm_RAM_Req;
-string instanceName;
+extern int pmType1Count;
+extern int pmType2Count;
 
-map<string, int> PmLowerBounds;
-int TOTAL_PM_COUNT;
-// These below will not be used, but can be useful later
-int* pm_CPU; //If PMs have different specs, this will be useful
-int* pm_RAM; //If PMs have different specs, this will be useful
+extern int* vm_CPU_Req;
+extern int* vm_RAM_Req;
+extern int* pm_CPU;
+extern int* pm_RAM;
 
+extern std::string instanceName;
+extern std::map<std::string, int> PmLowerBounds;
 
-unsigned long countVMs(unsigned long vm);
-unsigned long countVectorVMs(vector<unsigned long> vm);
-vector<unsigned long> idToVM(int id);
-vector<unsigned long> createEmptyM();
-vector<unsigned long> bitwiseOrMs(vector<unsigned long> m1,vector<unsigned long> m2);
-vector<unsigned long> bitwiseAndMs(vector<unsigned long> m1,vector<unsigned long> m2);
-vector<unsigned long> bitwiseXorMs(vector<unsigned long> m1,vector<unsigned long> m2);
-vector<unsigned long> bitwiseNotMs(vector<unsigned long> m1);
-vector<unsigned long> bitwiseSLMs(vector<unsigned long> m1, unsigned long shift);
-vector<unsigned long> bitwiseSRMs(vector<unsigned long> m1, unsigned long shift);
-void printPM(vector<unsigned long> pm);
-unsigned long checkSameVM(vector<unsigned long> pm1,vector<unsigned long> pm2);
-vector<unsigned long> removeSpecificVM(vector<unsigned long> pm,vector<unsigned long> vm);
-#endif // BIT_OPERATIONS_H_INCLUDED
+using VmPlacement = std::vector<unsigned long>;
+using Solution = std::vector<VmPlacement>;
+
+// --- Bit-vector VM helpers ---
+unsigned long countVMs(unsigned long word);
+unsigned long countVectorVMs(const VmPlacement& pm);
+VmPlacement idToVM(int id);
+VmPlacement createEmptyM();
+VmPlacement bitwiseOrMs(const VmPlacement& a, const VmPlacement& b);
+VmPlacement bitwiseAndMs(const VmPlacement& a, const VmPlacement& b);
+VmPlacement bitwiseXorMs(const VmPlacement& a, const VmPlacement& b);
+VmPlacement bitwiseNotMs(const VmPlacement& a);
+VmPlacement bitwiseSLMs(const VmPlacement& a, unsigned long shift);
+VmPlacement bitwiseSRMs(const VmPlacement& a, unsigned long shift);
+void printPM(const VmPlacement& pm);
+unsigned long checkSameVM(const VmPlacement& a, const VmPlacement& b);
+VmPlacement removeSpecificVM(const VmPlacement& pm, const VmPlacement& vm);
+
+// --- I/O and initialization ---
+void readFile(std::ifstream& f);
+void readFileC(std::ifstream& f);
+Solution initialize(std::ifstream& f, bool isCDataset);
+void initializeLowerBounds(std::ifstream& infile);
+
+// --- Local search operators ---
+void moveBit(VmPlacement& source, VmPlacement& dest, int vmId);
+void swapBits(VmPlacement& pm1, VmPlacement& pm2, int vmId1, int vmId2);
+unsigned long run(Solution& solution);
+
+// --- Benchmark driver ---
+void openDataset(const std::string& datasetPath);
+
+#endif

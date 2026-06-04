@@ -1,196 +1,417 @@
-#include <stdio.h>
-#include <iostream>
-#include <cmath>
-#include <bitset>
 #include "bit_operations.h"
-#include <fstream>
-#include <sstream>
-#include <random>
-#include <iostream>
+
+#include <algorithm>
+#include <bitset>
 #include <chrono>
 #include <climits>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <functional>
+#include <numeric>
+#include <random>
+#include <sstream>
 
 #include <experimental/filesystem>
+namespace fs = std::experimental::filesystem;
 
-const int MAX=10;
-namespace std {
-    namespace fs = experimental::filesystem;
+// --- Global instance state ---
+int TOTAL_VM_COUNT = 0;
+int TOTAL_PM_COUNT = 0;
+int cpu_cap = 0;
+int ram_cap = 0;
+int cpu_cap2 = 0;
+int ram_cap2 = 0;
+int pmType1Count = 0;
+int pmType2Count = 0;
+int* vm_CPU_Req = nullptr;
+int* vm_RAM_Req = nullptr;
+int* pm_CPU = nullptr;
+int* pm_RAM = nullptr;
+std::string instanceName;
+std::map<std::string, int> PmLowerBounds;
+
+namespace {
+
+constexpr int kBenchmarkRuns = 10;
+constexpr float kSwapProbability = 0.0f;
+constexpr float kMoveProbability = 0.99f;
+constexpr int kMoveCandidates = 24;//24
+constexpr int kStallLimit = 3000;
+const auto kSearchDuration = std::chrono::seconds(5);
+
+using std::mt19937;
+using std::uniform_int_distribution;
+using std::uniform_real_distribution;
+
+// --- Bit iteration ---
+
+int lowestSetBit(unsigned long word) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_ctzl(word);
+#else
+    int bit = 0;
+    while (((word >> bit) & 1UL) == 0) ++bit;
+    return bit;
+#endif
 }
-//namespace fs = std::experimental/filesystem;
 
-//Brian Kernighan Algorithm
-unsigned long countVMs(unsigned long vm){
-
-    unsigned long count =0;
-    while(vm > 0){
-        vm = vm & (vm-1);
-        count++;
-    }
-    return count;
-}
-
-//Brian Kernighan Algorithm with vector VMs
-unsigned long countVectorVMs(vector<unsigned long> vm){
-    unsigned long count =0;
-    for(int i=0;i<vm.size();i++){
-        count += countVMs(vm.at(i));
-    }
-    return count;
-}
-
-vector<unsigned long> idToVM(int id){
-
-    vector<unsigned long> vm = {};
-    int totalChunks = std::ceil((double)TOTAL_VM_COUNT / CONTAINER_SIZE);
-    int chunk= id / CONTAINER_SIZE ;
-
-    for(int i=0;i<totalChunks;i++){
-
-        if( i == chunk){
-            int coord = id % CONTAINER_SIZE;
-            unsigned long num = 1;
-            num = num << coord;
-            vm.insert(vm.begin(), num);
+void forEachVmOnPm(const VmPlacement& pm, const std::function<void(int vmId)>& fn) {
+    for (size_t chunk = 0; chunk < pm.size(); ++chunk) {
+        unsigned long word = pm[chunk];
+        while (word) {
+            const int bit = lowestSetBit(word);
+            const int vmId = static_cast<int>(chunk) * CONTAINER_SIZE + bit;
+            if (vmId < TOTAL_VM_COUNT) {
+                fn(vmId);
+            }
+            word &= word - 1;
         }
-        else vm.insert(vm.begin(), 0);
     }
+}
+
+// --- Fitness ---
+
+unsigned long overloadFitness(int cpuExcess, int ramExcess) {
+    const int cpuPenalty = (cpuExcess > 0 ? cpuExcess : 0);
+    const int ramPenalty = (ramExcess > 0 ? ramExcess : 0);
+    if (cpuPenalty == 0) return static_cast<unsigned long>(ramPenalty);
+    if (ramPenalty == 0) return static_cast<unsigned long>(cpuPenalty);
+    return static_cast<unsigned long>(cpuPenalty * ramPenalty);
+}
+
+unsigned long pmFitnessValue(int cpuUsed, int ramUsed, int pmIndex) {
+    return overloadFitness(cpuUsed - pm_CPU[pmIndex], ramUsed - pm_RAM[pmIndex]);
+}
+
+void pmResourceUsage(const VmPlacement& pm, int& cpu, int& ram) {
+    cpu = 0;
+    ram = 0;
+    forEachVmOnPm(pm, [&](int vmId) {
+        cpu += vm_CPU_Req[vmId];
+        ram += vm_RAM_Req[vmId];
+    });
+}
+
+int randomVmOnPm(const VmPlacement& pm, mt19937& gen) {
+    const int vmCount = static_cast<int>(countVectorVMs(pm));
+    if (vmCount == 0) return -1;
+
+    uniform_int_distribution<> pick(0, vmCount - 1);
+    const int target = pick(gen);
+    int seen = 0;
+    int chosen = -1;
+    forEachVmOnPm(pm, [&](int vmId) {
+        if (seen == target) chosen = vmId;
+        ++seen;
+    });
+    return chosen;
+}
+
+// --- Local search state ---
+
+struct LocalSearchState {
+    Solution& solution;
+    const int pmCount;
+    std::vector<int> pmCpu;
+    std::vector<int> pmRam;
+    std::vector<unsigned long> pmFitness;
+    std::vector<int> overloaded;
+    std::vector<int> underloaded;
+    unsigned long totalFitness = 0;
+
+    explicit LocalSearchState(Solution& sol)
+        : solution(sol),
+          pmCount(TOTAL_PM_COUNT),
+          pmCpu(pmCount),
+          pmRam(pmCount),
+          pmFitness(pmCount) {
+        overloaded.reserve(pmCount);
+        underloaded.reserve(pmCount);
+    }
+
+    void syncFromSolution() {
+        totalFitness = 0;
+        overloaded.clear();
+        underloaded.clear();
+        for (int i = 0; i < pmCount; ++i) {
+            pmResourceUsage(solution[i], pmCpu[i], pmRam[i]);
+            pmFitness[i] = pmFitnessValue(pmCpu[i], pmRam[i], i);
+            totalFitness += pmFitness[i];
+            (pmFitness[i] > 0 ? overloaded : underloaded).push_back(i);
+        }
+    }
+
+    void refreshLoadLists() {
+        overloaded.clear();
+        underloaded.clear();
+        for (int i = 0; i < pmCount; ++i) {
+            (pmFitness[i] > 0 ? overloaded : underloaded).push_back(i);
+        }
+    }
+
+    unsigned long candidateTotalFitness(
+        int src, int dst,
+        int newCpuSrc, int newRamSrc,
+        int newCpuDst, int newRamDst) const {
+        const unsigned long fSrc = pmFitnessValue(newCpuSrc, newRamSrc, src);
+        const unsigned long fDst = pmFitnessValue(newCpuDst, newRamDst, dst);
+        return totalFitness - pmFitness[src] - pmFitness[dst] + fSrc + fDst;
+    }
+
+    void commitPairUpdate(int src, int dst) {
+        const unsigned long oldSrc = pmFitness[src];
+        const unsigned long oldDst = pmFitness[dst];
+        pmFitness[src] = pmFitnessValue(pmCpu[src], pmRam[src], src);
+        pmFitness[dst] = pmFitnessValue(pmCpu[dst], pmRam[dst], dst);
+        totalFitness = totalFitness - oldSrc - oldDst + pmFitness[src] + pmFitness[dst];
+        refreshLoadLists();
+    }
+};
+
+struct MoveCandidate {
+    int dst = -1;
+    int partnerVm = -1;
+    unsigned long fitness = ULONG_MAX;
+};
+
+int pickSourcePm(const LocalSearchState& state, mt19937& gen) {
+    if (!state.overloaded.empty()) {
+        uniform_int_distribution<> dist(0, static_cast<int>(state.overloaded.size()) - 1);
+        return state.overloaded[dist(gen)];
+    }
+    uniform_int_distribution<> dist(0, state.pmCount - 1);
+    return dist(gen);
+}
+
+MoveCandidate findBestMoveCandidate(
+    const LocalSearchState& state,
+    mt19937& gen,
+    int src,
+    int vm,
+    bool swap,
+    uniform_int_distribution<>& destDist) {
+    MoveCandidate best;
+    for (int c = 0; c < kMoveCandidates; ++c) {
+        const int dst = destDist(gen);
+        if (dst == src) continue;
+
+        int partnerVm = -1;
+        int newCpuSrc, newRamSrc, newCpuDst, newRamDst;
+
+        if (swap) {
+            partnerVm = randomVmOnPm(state.solution[dst], gen);
+            if (partnerVm < 0) continue;
+            newCpuSrc = state.pmCpu[src] - vm_CPU_Req[vm] + vm_CPU_Req[partnerVm];
+            newRamSrc = state.pmRam[src] - vm_RAM_Req[vm] + vm_RAM_Req[partnerVm];
+            newCpuDst = state.pmCpu[dst] + vm_CPU_Req[vm] - vm_CPU_Req[partnerVm];
+            newRamDst = state.pmRam[dst] + vm_RAM_Req[vm] - vm_RAM_Req[partnerVm];
+        } else {
+            newCpuSrc = state.pmCpu[src] - vm_CPU_Req[vm];
+            newRamSrc = state.pmRam[src] - vm_RAM_Req[vm];
+            newCpuDst = state.pmCpu[dst] + vm_CPU_Req[vm];
+            newRamDst = state.pmRam[dst] + vm_RAM_Req[vm];
+        }
+
+        const unsigned long candFit = state.candidateTotalFitness(
+            src, dst, newCpuSrc, newRamSrc, newCpuDst, newRamDst);
+        if (candFit < best.fitness) {
+            best = {dst, partnerVm, candFit};
+        }
+    }
+    return best;
+}
+
+void applyMove(LocalSearchState& state, int src, int dst, int vm) {
+    moveBit(state.solution[src], state.solution[dst], vm);
+    state.pmCpu[src] -= vm_CPU_Req[vm];
+    state.pmRam[src] -= vm_RAM_Req[vm];
+    state.pmCpu[dst] += vm_CPU_Req[vm];
+    state.pmRam[dst] += vm_RAM_Req[vm];
+}
+
+void applySwap(LocalSearchState& state, int src, int dst, int vm, int partnerVm) {
+    swapBits(state.solution[src], state.solution[dst], vm, partnerVm);
+    state.pmCpu[src] -= vm_CPU_Req[vm];
+    state.pmRam[src] -= vm_RAM_Req[vm];
+    state.pmCpu[dst] += vm_CPU_Req[vm];
+    state.pmRam[dst] += vm_RAM_Req[vm];
+    state.pmCpu[src] += vm_CPU_Req[partnerVm];
+    state.pmRam[src] += vm_RAM_Req[partnerVm];
+    state.pmCpu[dst] -= vm_CPU_Req[partnerVm];
+    state.pmRam[dst] -= vm_RAM_Req[partnerVm];
+}
+
+bool runElimination(LocalSearchState& state, mt19937& gen) {
+    if (state.overloaded.empty() || state.underloaded.empty()) {
+        return false;
+    }
+
+    bool anyMoved = false;
+    const std::vector<int> sources = state.overloaded;
+    for (int src : sources) {
+        const int vm = randomVmOnPm(state.solution[src], gen);
+        if (vm < 0) continue;
+
+        uniform_int_distribution<> ulDist(0, static_cast<int>(state.underloaded.size()) - 1);
+        const int dst = state.underloaded[ulDist(gen)];
+        if (dst == src) continue;
+
+        moveBit(state.solution[src], state.solution[dst], vm);
+        anyMoved = true;
+    }
+    if (anyMoved) {
+        state.syncFromSolution();
+    }
+    return anyMoved;
+}
+
+bool runGuidedStep(LocalSearchState& state, mt19937& gen, bool swap, uniform_int_distribution<>& destDist) {
+    const int src = pickSourcePm(state, gen);
+    const int vm = randomVmOnPm(state.solution[src], gen);
+    if (vm < 0) return false;
+
+    const MoveCandidate best = findBestMoveCandidate(state, gen, src, vm, swap, destDist);
+    if (best.dst < 0 || best.fitness >= state.totalFitness) {
+        return false;
+    }
+
+    if (swap) {
+        applySwap(state, src, best.dst, vm, best.partnerVm);
+    } else {
+        applyMove(state, src, best.dst, vm);
+    }
+    state.commitPairUpdate(src, best.dst);
+    return true;
+}
+
+}  // namespace
+
+// --- Bit-vector VM helpers ---
+
+unsigned long countVMs(unsigned long vm) {
+    unsigned long count = 0;
+    while (vm > 0) {
+        vm &= vm - 1;
+        ++count;
+    }
+    return count;
+}
+
+unsigned long countVectorVMs(const VmPlacement& vm) {
+    unsigned long count = 0;
+    for (unsigned long word : vm) {
+        count += countVMs(word);
+    }
+    return count;
+}
+
+VmPlacement idToVM(int id) {
+    const int totalChunks = (TOTAL_VM_COUNT + CONTAINER_SIZE - 1) / CONTAINER_SIZE;
+    const int chunk = id / CONTAINER_SIZE;
+    VmPlacement vm(totalChunks, 0UL);
+    vm[chunk] = 1UL << (id % CONTAINER_SIZE);
     return vm;
 }
 
-vector<unsigned long> createEmptyM(){
-
-    vector<unsigned long> vm = {};
-    for(int i=0;i<TOTAL_VM_COUNT;i+=CONTAINER_SIZE){
-        vm.insert(vm.begin(), 0);
-    }
-    return vm;
+VmPlacement createEmptyM() {
+    const int totalChunks = (TOTAL_VM_COUNT + CONTAINER_SIZE - 1) / CONTAINER_SIZE;
+    return VmPlacement(totalChunks, 0UL);
 }
 
-vector<unsigned long> bitwiseOrMs(vector<unsigned long> m1,vector<unsigned long> m2){
-
-    vector<unsigned long> resultVector={};
-
-    for(int i=0; i< m1.size();i++){
-        unsigned long result = m1.at(i) | m2.at(i);
-        resultVector.push_back(result);
+VmPlacement bitwiseOrMs(const VmPlacement& m1, const VmPlacement& m2) {
+    VmPlacement result(m1.size());
+    for (size_t i = 0; i < m1.size(); ++i) {
+        result[i] = m1[i] | m2[i];
     }
-    return resultVector;
+    return result;
 }
 
-vector<unsigned long> bitwiseAndMs(vector<unsigned long> m1,vector<unsigned long> m2){
-
-    vector<unsigned long> resultVector={};
-
-    for(int i=0; i< m1.size();i++){
-        unsigned long result = m1.at(i) & m2.at(i);
-        resultVector.push_back(result);
+VmPlacement bitwiseAndMs(const VmPlacement& m1, const VmPlacement& m2) {
+    VmPlacement result(m1.size());
+    for (size_t i = 0; i < m1.size(); ++i) {
+        result[i] = m1[i] & m2[i];
     }
-    return resultVector;
+    return result;
 }
 
-vector<unsigned long> bitwiseXorMs(vector<unsigned long> m1,vector<unsigned long> m2){
-
-    vector<unsigned long> resultVector={};
-
-    for(int i=0; i< m1.size();i++){
-        unsigned long result = m1.at(i) ^ m2.at(i);
-        resultVector.push_back(result);
+VmPlacement bitwiseXorMs(const VmPlacement& m1, const VmPlacement& m2) {
+    VmPlacement result(m1.size());
+    for (size_t i = 0; i < m1.size(); ++i) {
+        result[i] = m1[i] ^ m2[i];
     }
-    return resultVector;
+    return result;
 }
 
-vector<unsigned long> bitwiseNotMs(vector<unsigned long> m1){
-
-    vector<unsigned long> resultVector={};
-
-    for(int i=0; i< m1.size();i++){
-        resultVector.push_back(~m1.at(i));
+VmPlacement bitwiseNotMs(const VmPlacement& m1) {
+    VmPlacement result(m1.size());
+    for (size_t i = 0; i < m1.size(); ++i) {
+        result[i] = ~m1[i];
     }
-    return resultVector;
+    return result;
 }
 
-vector<unsigned long> bitwiseSLMs(vector<unsigned long> m1, unsigned long shift) {
-    vector<unsigned long> result = createEmptyM();
-    int blockShift = shift / CONTAINER_SIZE;     // how many whole elements to shift
-    int bitShift   = shift % CONTAINER_SIZE;     // remaining bit shift
+VmPlacement bitwiseSLMs(const VmPlacement& m1, unsigned long shift) {
+    VmPlacement result = createEmptyM();
+    const int blockShift = static_cast<int>(shift / CONTAINER_SIZE);
+    const int bitShift = static_cast<int>(shift % CONTAINER_SIZE);
 
-    for (int i = m1.size() - 1; i >= 0; i--) {
-        if (i + blockShift >= m1.size()) continue;
-        // Shift current block
-        result.at(i) |= (m1.at(i + blockShift) << bitShift);
-        //result[i] |= m1[i - blockShift] << bitShift;
-
-        // Handle carry from previous block
-        if ( bitShift != 0 && i + blockShift + 2 <=m1.size()) {
-
-            //result[i] |= m1[i - blockShift - 1] >> (BITS - bitShift);
-            result.at(i) |= (m1.at(i + blockShift+1) >> (CONTAINER_SIZE - bitShift));
+    for (int i = static_cast<int>(m1.size()) - 1; i >= 0; --i) {
+        if (i + blockShift >= static_cast<int>(m1.size())) continue;
+        result[i] |= (m1[i + blockShift] << bitShift);
+        if (bitShift != 0 && i + blockShift + 2 <= static_cast<int>(m1.size())) {
+            result[i] |= (m1[i + blockShift + 1] >> (CONTAINER_SIZE - bitShift));
         }
     }
     return result;
 }
 
-vector<unsigned long> bitwiseSRMs(vector<unsigned long> m1, unsigned long shift) {
-    vector<unsigned long> result = createEmptyM();
-    int blockShift = shift / CONTAINER_SIZE;     // how many whole elements to shift
-    int bitShift   = shift % CONTAINER_SIZE;     // remaining bit shift
+VmPlacement bitwiseSRMs(const VmPlacement& m1, unsigned long shift) {
+    VmPlacement result = createEmptyM();
+    const int blockShift = static_cast<int>(shift / CONTAINER_SIZE);
+    const int bitShift = static_cast<int>(shift % CONTAINER_SIZE);
 
-    for (unsigned long i = 0; i < m1.size(); i++) {
-        if (i - blockShift < 0) continue;
-        // Shift current block
-        result.at(i) |= (m1.at(i - blockShift) >> bitShift);
-
-        // Handle carry from previous block
-        if ( bitShift != 0 && i - blockShift >0) {
-            result.at(i) |= (m1.at(i - blockShift-1) << (CONTAINER_SIZE - bitShift));
+    for (size_t i = 0; i < m1.size(); ++i) {
+        if (static_cast<int>(i) - blockShift < 0) continue;
+        result[i] |= (m1[i - blockShift] >> bitShift);
+        if (bitShift != 0 && static_cast<int>(i) - blockShift > 0) {
+            result[i] |= (m1[i - blockShift - 1] << (CONTAINER_SIZE - bitShift));
         }
     }
     return result;
 }
 
-/*
-    Prints a VM or a PM
-*/
-void printPM(vector<unsigned long> pm) {
-
-    for (unsigned long n : pm){
-        cout<<bitset<CONTAINER_SIZE>(n)<<" ";
-        //cout << format("{:b}",n ) << " ";
+void printPM(const VmPlacement& pm) {
+    for (unsigned long n : pm) {
+        std::cout << std::bitset<CONTAINER_SIZE>(n) << ' ';
     }
-    cout<<endl;
+    std::cout << '\n';
 }
 
-unsigned long checkSameVM(vector<unsigned long> pm1,vector<unsigned long> pm2){
-    return countVectorVMs(bitwiseAndMs(pm1,pm2)) == 1;
+unsigned long checkSameVM(const VmPlacement& pm1, const VmPlacement& pm2) {
+    return countVectorVMs(bitwiseAndMs(pm1, pm2)) == 1;
 }
 
-/*  there should be only single '1' bit in vm
-    pm can have multiple '1' bits
-*/
-vector<unsigned long> removeSpecificVM(vector<unsigned long> pm,vector<unsigned long> vm){
-    //return pm & (~vm);
-    return bitwiseAndMs(pm,bitwiseNotMs(vm));
+VmPlacement removeSpecificVM(const VmPlacement& pm, const VmPlacement& vm) {
+    return bitwiseAndMs(pm, bitwiseNotMs(vm));
 }
 
-//for reading A & B datasets
-void readFile(ifstream &f){
-    string s;
-    //1st Line is File Name
-    getline(f, s);
-    instanceName = s;
-    //2nd Line is total PM count this will NOT be used in our code
-    getline(f, s);
-    TOTAL_PM_COUNT = stoi(s);
+// --- I/O ---
 
-    //3rd Line is CPU cap
-    getline(f, s);
-    cpu_cap = stoi(s);
-    //4th Line is RAM cap
-    getline(f, s);
-    ram_cap = stoi(s);
-    //5th Line is total VM count
-    getline(f, s);
-    TOTAL_VM_COUNT = stoi(s);
+void readFile(std::ifstream& f) {
+    std::string line;
+    std::getline(f, line);
+    instanceName = line;
+
+    std::getline(f, line);
+    TOTAL_PM_COUNT = stoi(line);
+    std::getline(f, line);
+    cpu_cap = stoi(line);
+    std::getline(f, line);
+    ram_cap = stoi(line);
+    std::getline(f, line);
+    TOTAL_VM_COUNT = stoi(line);
 
     vm_CPU_Req = new int[TOTAL_VM_COUNT];
     vm_RAM_Req = new int[TOTAL_VM_COUNT];
@@ -200,57 +421,59 @@ void readFile(ifstream &f){
         pm_CPU[j] = cpu_cap;
         pm_RAM[j] = ram_cap;
     }
-    int i=0;
-    while (getline(f, s)){
-        stringstream  stringStream(s);
-        string s2;
-        getline(stringStream, s2, ' ');
-        vm_CPU_Req[i]= stoi(s2);
-        getline(stringStream, s2, ' ');
-        vm_RAM_Req[i]= stoi(s2);
-        i++;
+
+    int vmId = 0;
+    while (std::getline(f, line)) {
+        std::stringstream ss(line);
+        std::string token;
+        std::getline(ss, token, ' ');
+        vm_CPU_Req[vmId] = stoi(token);
+        std::getline(ss, token, ' ');
+        vm_RAM_Req[vmId] = stoi(token);
+        ++vmId;
     }
 }
-//For reading C dataset
-void readFileC(ifstream &f){
-    string s;
-    string s2;
 
-    //1st Line is File Name
-    getline(f, s);
-    instanceName = s;
-    //2nd Line is 2 integers representing counts of 2 types of PMs
-    getline(f, s);
-    stringstream  stringStream(s);
-    getline(stringStream, s2, ',');
-    pmType1Count = stoi(s2);
-    getline(stringStream, s2, ',');
-    pmType2Count = stoi(s2);
+void readFileC(std::ifstream& f) {
+    std::string line;
+    std::string token;
+
+    std::getline(f, line);
+    instanceName = line;
+
+    std::getline(f, line);
+    {
+        std::stringstream ss(line);
+        std::getline(ss, token, ',');
+        pmType1Count = stoi(token);
+        std::getline(ss, token, ',');
+        pmType2Count = stoi(token);
+    }
     TOTAL_PM_COUNT = pmType1Count + pmType2Count;
 
-    //3rd line is CPU & RAM caps of pm1s
-    getline(f, s);
-    stringstream  stringStream2(s);
-    getline(stringStream2, s2, ',');
-    cpu_cap = stoi(s2);
-    getline(stringStream2, s2, ',');
-    ram_cap = stoi(s2);
+    std::getline(f, line);
+    {
+        std::stringstream ss(line);
+        std::getline(ss, token, ',');
+        cpu_cap = stoi(token);
+        std::getline(ss, token, ',');
+        ram_cap = stoi(token);
+    }
 
-    //4th Line is CPU & RAM caps of pm2s
-    getline(f, s);
-    stringstream  stringStream3(s);
-    getline(stringStream3, s2, ',');
-    cpu_cap2 = stoi(s2);
-    getline(stringStream3, s2, ',');
-    ram_cap2 = stoi(s2);
+    std::getline(f, line);
+    {
+        std::stringstream ss(line);
+        std::getline(ss, token, ',');
+        cpu_cap2 = stoi(token);
+        std::getline(ss, token, ',');
+        ram_cap2 = stoi(token);
+    }
 
-    //5th Line is total VM count
-    getline(f, s);
-    TOTAL_VM_COUNT = stoi(s);
+    std::getline(f, line);
+    TOTAL_VM_COUNT = stoi(line);
 
     vm_CPU_Req = new int[TOTAL_VM_COUNT];
     vm_RAM_Req = new int[TOTAL_VM_COUNT];
-
     pm_CPU = new int[TOTAL_PM_COUNT];
     pm_RAM = new int[TOTAL_PM_COUNT];
     for (int j = 0; j < pmType1Count; ++j) {
@@ -262,42 +485,65 @@ void readFileC(ifstream &f){
         pm_RAM[j] = ram_cap2;
     }
 
-    int i=0;
-    while (getline(f, s)){
-        stringstream  stringStream4(s);
-        getline(stringStream4, s2, ' ');
-        vm_CPU_Req[i]= stoi(s2);
-        getline(stringStream4, s2, ' ');
-        vm_RAM_Req[i]= stoi(s2);
-        i++;
+    int vmId = 0;
+    while (std::getline(f, line)) {
+        std::stringstream ss(line);
+        std::getline(ss, token, ' ');
+        vm_CPU_Req[vmId] = stoi(token);
+        std::getline(ss, token, ' ');
+        vm_RAM_Req[vmId] = stoi(token);
+        ++vmId;
     }
 }
 
-void printSolution(vector<vector<unsigned long>> solution) {
-
-    cout<< "The solution is:" <<endl;
-    for (vector<unsigned long> pm : solution){
-        printPM(pm);
-    }
-}
-
-vector<vector<unsigned long>> initialSolution(){
+Solution initialSolution() {
     const int chunkCount = (TOTAL_VM_COUNT + CONTAINER_SIZE - 1) / CONTAINER_SIZE;
-    vector<vector<unsigned long>> solution(
-        TOTAL_PM_COUNT, vector<unsigned long>(chunkCount, 0UL));
+    Solution solution(TOTAL_PM_COUNT, VmPlacement(chunkCount, 0UL));
 
-    mt19937 gen(random_device{}());
-    uniform_int_distribution<> distrib(0, TOTAL_PM_COUNT - 1);
+    std::vector<int> pmCpu(TOTAL_PM_COUNT);
+    std::vector<int> pmRam(TOTAL_PM_COUNT);
+    for (int j = 0; j < TOTAL_PM_COUNT; ++j) {
+        pmCpu[j] = pm_CPU[j];
+        pmRam[j] = pm_RAM[j];
+    }
+
+    std::vector<int> pmOrder(TOTAL_PM_COUNT);
+    std::iota(pmOrder.begin(), pmOrder.end(), 0);
+
+    mt19937 gen(std::random_device{}());
+    uniform_int_distribution<> pmPick(0, TOTAL_PM_COUNT - 1);
 
     for (int vmId = 0; vmId < TOTAL_VM_COUNT; ++vmId) {
-        vector<unsigned long> &pm = solution[distrib(gen)];
+        const unsigned long vmFit = overloadFitness(vm_CPU_Req[vmId], vm_RAM_Req[vmId]);
+
+        std::sort(pmOrder.begin(), pmOrder.end(), [&](int a, int b) {
+            const unsigned long fitA = overloadFitness(pmCpu[a], pmRam[a]);
+            const unsigned long fitB = overloadFitness(pmCpu[b], pmRam[b]);
+            return fitA > fitB;
+        });
+
+        int assignedPm = -1;
+        for (int pmIdx : pmOrder) {
+            if (overloadFitness(pmCpu[pmIdx], pmRam[pmIdx]) >= vmFit) {
+                assignedPm = pmIdx;
+                break;
+            }
+        }
+        if (assignedPm < 0) {
+            assignedPm = pmPick(gen);
+        }
+
+        VmPlacement& pm = solution[assignedPm];
         const int chunk = vmId / CONTAINER_SIZE;
         pm[chunk] |= (1UL << (vmId % CONTAINER_SIZE));
+        pmCpu[assignedPm] -= vm_CPU_Req[vmId];
+        pmRam[assignedPm] -= vm_RAM_Req[vmId];
     }
+
     return solution;
 }
 
-vector<vector<unsigned long>> initialize(ifstream &f, bool isCDataset){
+Solution initialize(std::ifstream& f, bool isCDataset) {
     if (isCDataset) {
         readFileC(f);
     } else {
@@ -306,301 +552,142 @@ vector<vector<unsigned long>> initialize(ifstream &f, bool isCDataset){
     return initialSolution();
 }
 
-static void pmResourceUsage(const vector<unsigned long> &pm, int &cpu, int &ram) {
-    cpu = 0;
-    ram = 0;
-    for (size_t chunk = 0; chunk < pm.size(); ++chunk) {
-        unsigned long word = pm[chunk];
-        while (word) {
-#if defined(__GNUC__) || defined(__clang__)
-            int bit = __builtin_ctzl(word);
-#else
-            int bit = 0;
-            while (((word >> bit) & 1UL) == 0) ++bit;
-#endif
-            int vmId = static_cast<int>(chunk) * CONTAINER_SIZE + bit;
-            if (vmId < TOTAL_VM_COUNT) {
-                cpu += vm_CPU_Req[vmId];
-                ram += vm_RAM_Req[vmId];
-            }
-            word &= word - 1;
-        }
-    }
-}
-// 0 if either cpu or ram usage is < capacity
-static unsigned long pmExcessFromUsage(int cpu, int ram, int pmIndex) {
-    int cpuExceed = cpu - pm_CPU[pmIndex];
-    int ramExceed = ram - pm_RAM[pmIndex];
-    int cpuPenalty = (cpuExceed > 0 ? cpuExceed : 0);
-    int ramPenalty = (ramExceed > 0 ? ramExceed : 0);
-
-    if (cpuPenalty == 0) return static_cast<unsigned long>(ramPenalty);
-    if (ramPenalty == 0) return static_cast<unsigned long>(cpuPenalty);
-    return static_cast<unsigned long>(cpuPenalty * ramPenalty);
-}
-
-static unsigned long pmExcessFitness(const vector<unsigned long> &pm, int pmIndex) {
-    int cpu = 0;
-    int ram = 0;
-    pmResourceUsage(pm, cpu, ram);
-    return pmExcessFromUsage(cpu, ram, pmIndex);
-}
-//Finds a 1 bit on a PM
-static int randomVmOnPm(const vector<unsigned long> &pm, mt19937 &gen) {
-    int vmCount = static_cast<int>(countVectorVMs(pm));
-    if (vmCount == 0) return -1;
-
-    uniform_int_distribution<> pick(0, vmCount - 1);
-    int target = pick(gen);
-    int seen = 0;
-    for (size_t chunk = 0; chunk < pm.size(); ++chunk) {
-        unsigned long word = pm[chunk];
-        while (word) {
-#if defined(__GNUC__) || defined(__clang__)
-            int bit = __builtin_ctzl(word);
-#else
-            int bit = 0;
-            while (((word >> bit) & 1UL) == 0) ++bit;
-#endif
-            int vmId = static_cast<int>(chunk) * CONTAINER_SIZE + bit;
-            if (vmId < TOTAL_VM_COUNT) {
-                if (seen == target) return vmId;
-                ++seen;
-            }
-            word &= word - 1;
-        }
-    }
-    return -1;
-}
-
-unsigned long fitnessFunction(vector<vector<unsigned long>> solution) {
-    unsigned long total = 0;
-    for (size_t i = 0; i < solution.size(); ++i) {
-        total += pmExcessFitness(solution[i], static_cast<int>(i));
-    }
-    return total;
-}
-/*
-Move a bit from source PM to dest PM
-*/
-void moveBit(vector<unsigned long> &source, vector<unsigned long> &dest, int coord){
+void moveBit(VmPlacement& source, VmPlacement& dest, int vmId) {
     if (&source == &dest) return;
-    int chunk = coord / CONTAINER_SIZE;
-    int bit = coord % CONTAINER_SIZE;
-    unsigned long mask = 1UL << bit;
+    const int chunk = vmId / CONTAINER_SIZE;
+    const int bit = vmId % CONTAINER_SIZE;
+    const unsigned long mask = 1UL << bit;
     if ((source[chunk] & mask) == 0) return;
     source[chunk] &= ~mask;
     dest[chunk] |= mask;
 }
 
-/*
-    Swap the bits of PMs
-*/
-void swapBits(vector<unsigned long> &pm1, vector<unsigned long> &pm2, int coord1,int coord2){
+void swapBits(VmPlacement& pm1, VmPlacement& pm2, int vmId1, int vmId2) {
     if (&pm1 == &pm2) return;
-    moveBit(pm1,pm2,coord1);
-    moveBit(pm2,pm1,coord2);
+    moveBit(pm1, pm2, vmId1);
+    moveBit(pm2, pm1, vmId2);
 }
 
-// Guided local search: move VMs off overloaded PMs toward better destinations.
-unsigned long run(vector<vector<unsigned long>> &solution){
-    const int pmCount = TOTAL_PM_COUNT;
-    const int moveCandidates = 24;
-    const int stallLimit = 3000;
+unsigned long run(Solution& solution) {
+    LocalSearchState state(solution);
+    state.syncFromSolution();
+    if (state.totalFitness == 0) return 0;
 
-    vector<int> pmCpu(pmCount);
-    vector<int> pmRam(pmCount);
-    vector<unsigned long> pmFitness(pmCount);
-    vector<int> overloaded;
-    overloaded.reserve(pmCount);
-
-    unsigned long bestFit = 0;
-    for (int i = 0; i < pmCount; ++i) {
-        pmResourceUsage(solution[i], pmCpu[i], pmRam[i]);
-        pmFitness[i] = pmExcessFromUsage(pmCpu[i], pmRam[i], i);
-        bestFit += pmFitness[i];
-        if (pmFitness[i] > 0) overloaded.push_back(i);
-    }
-    if (bestFit == 0) return 0;
-
-    mt19937 gen(random_device{}());
-    uniform_int_distribution<> pmDistr(0, pmCount - 1);
-    uniform_int_distribution<> destDistr(0, pmCount - 1);
+    mt19937 gen(std::random_device{}());
+    uniform_real_distribution<double> scenarioDist(0.0, 1.0);
+    uniform_int_distribution<> destDist(0, state.pmCount - 1);
 
     int stalls = 0;
-    auto limit = std::chrono::seconds(5);
-    auto start = std::chrono::steady_clock::now();
+    const auto start = std::chrono::steady_clock::now();
 
-    while ((std::chrono::steady_clock::now() - start) < limit &&
-           bestFit > 0 && stalls < stallLimit) {
-        int src;
-        if (!overloaded.empty()) {
-            uniform_int_distribution<> ovDistr(0, static_cast<int>(overloaded.size()) - 1);
-            src = overloaded[ovDistr(gen)];
+    while ((std::chrono::steady_clock::now() - start) < kSearchDuration &&
+           state.totalFitness > 0 && stalls < kStallLimit) {
+        const double roll = scenarioDist(gen);
+
+        if (roll >= kSwapProbability + kMoveProbability) {
+            if (!runElimination(state, gen)) ++stalls;
+            else stalls = 0;
+            continue;
+        }
+
+        const bool swap = roll < kSwapProbability;
+        if (!runGuidedStep(state, gen, swap, destDist)) {
+            ++stalls;
         } else {
-            src = pmDistr(gen);
-        }
-
-        int vm = randomVmOnPm(solution[src], gen);
-        if (vm < 0) {
-            ++stalls;
-            continue;
-        }
-
-        unsigned long bestCandFit = ULONG_MAX;
-        int bestDst = -1;
-        for (int c = 0; c < moveCandidates; ++c) {
-            int dst = destDistr(gen);
-            if (dst == src) continue;
-
-            int newCpuSrc = pmCpu[src] - vm_CPU_Req[vm];
-            int newRamSrc = pmRam[src] - vm_RAM_Req[vm];
-            int newCpuDst = pmCpu[dst] + vm_CPU_Req[vm];
-            int newRamDst = pmRam[dst] + vm_RAM_Req[vm];
-
-            unsigned long newF1 = pmExcessFromUsage(newCpuSrc, newRamSrc, src);
-            unsigned long newF2 = pmExcessFromUsage(newCpuDst, newRamDst, dst);
-            unsigned long candFit = bestFit - pmFitness[src] - pmFitness[dst] + newF1 + newF2;
-
-            if (candFit < bestCandFit) {
-                bestCandFit = candFit;
-                bestDst = dst;
-            }
-        }
-
-        if (bestDst < 0 || bestCandFit >= bestFit) {
-            ++stalls;
-            continue;
-        }
-
-        moveBit(solution[src], solution[bestDst], vm);
-        pmCpu[src] -= vm_CPU_Req[vm];
-        pmRam[src] -= vm_RAM_Req[vm];
-        pmCpu[bestDst] += vm_CPU_Req[vm];
-        pmRam[bestDst] += vm_RAM_Req[vm];
-
-        unsigned long oldSrcFit = pmFitness[src];
-        unsigned long oldDstFit = pmFitness[bestDst];
-        pmFitness[src] = pmExcessFromUsage(pmCpu[src], pmRam[src], src);
-        pmFitness[bestDst] = pmExcessFromUsage(pmCpu[bestDst], pmRam[bestDst], bestDst);
-        bestFit = bestFit - oldSrcFit - oldDstFit + pmFitness[src] + pmFitness[bestDst];
-
-        stalls = 0;
-        overloaded.clear();
-        for (int i = 0; i < pmCount; ++i) {
-            if (pmFitness[i] > 0) overloaded.push_back(i);
+            stalls = 0;
         }
     }
-    return bestFit;
+
+    return state.totalFitness;
 }
 
-void openDataset(string datasetPath){
-    int counter=0;
-    ofstream outputFile("outputQuality.csv");
-
-    outputFile << "File Name" <<"," << "Total PM Used" <<"," << "Lower Bound" <<","
-    << "Solution Quality" <<"," << "Fitness(Excess CPUxRAM)" <<","<< "Elapsed Time(nanoseconds)" << endl;
-
-    for (const auto& folder : fs::directory_iterator(datasetPath)){
-        if (fs::is_directory(folder)){
-            //cout << "Processing folder: " << folder.path().filename() << "\n";
-            for (const auto& file : fs::directory_iterator(folder)) {
-                //cout << " Processing  File: " << file.path() << "\n";
-                for(int i = 0; i < MAX; i++){ // to run same data file multiple times
-                    if (fs::is_regular_file(file)) {// free function instead of member
-                        ifstream f(file.path().string());
-                        if (!f.is_open()) {
-                            cerr << "Error opening the file!"<<file.path().string()<<endl;
-                            exit(1);
-                        }
-
-                        const string filePath = file.path().string();
-                        const bool isCDataset = filePath.find('C') != string::npos;
-
-                        //create initial solution
-                        vector<vector<unsigned long>> solution = initialize(f, isCDataset);
-                        // TOTAL_PM_COUNT set in the file
-                        const int filePmCount = TOTAL_PM_COUNT;
-                        // File name
-                        string lbKey = file.path().stem().string();
-                        // Lowest Possible PM amount
-                        int lowerBound = PmLowerBounds.count(lbKey) ? PmLowerBounds[lbKey] : filePmCount;
-
-                        TOTAL_PM_COUNT = lowerBound;
-                        std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
-                        unsigned long bestFit = run(solution);
-
-                        while (bestFit != 0 && TOTAL_PM_COUNT < filePmCount) {
-                            TOTAL_PM_COUNT++;
-                            if (solution.size() < static_cast<size_t>(TOTAL_PM_COUNT)) {
-                                solution = initialSolution();
-                            }
-                            bestFit = run(solution);
-                        }
-                        std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-                        //Write out the Solution Quality
-
-                        outputFile << lbKey <<","
-                            << TOTAL_PM_COUNT <<"," << lowerBound <<","
-                            << 100 * (TOTAL_PM_COUNT / (double)lowerBound - 1 ) <<","
-                            << bestFit <<","
-                            << std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()  << endl;
-                        outputFile.flush();
-
-                        f.close();
-                    }
-                }
-                counter++;
-            }
-        }
-    }
-    outputFile.close();
-}
-
-void initializeLowerBounds(ifstream &infile){
+void initializeLowerBounds(std::ifstream& infile) {
     PmLowerBounds.clear();
-    string line;
-    while (getline(infile, line)) {
-        
-        // Strip BOM from the first line
+    std::string line;
+    while (std::getline(infile, line)) {
         if (line.size() >= 3 &&
-            (unsigned char)line[0] == 0xEF &&
-            (unsigned char)line[1] == 0xBB &&
-            (unsigned char)line[2] == 0xBF) {
+            static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB &&
+            static_cast<unsigned char>(line[2]) == 0xBF) {
             line = line.substr(3);
         }
-
-        // Strip \r in case of Windows line endings
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
+        if (line.empty()) continue;
 
-        if (!line.empty()) {
-            stringstream ss(line);
-            string fileName;
-            int lowerBound;
-            
-            if (ss >> fileName >> lowerBound) {
-                //fileName += ".vmp";
-                PmLowerBounds[fileName] = lowerBound;
-            }
-
+        std::stringstream ss(line);
+        std::string fileName;
+        int lowerBound;
+        if (ss >> fileName >> lowerBound) {
+            PmLowerBounds[fileName] = lowerBound;
         }
     }
 }
 
-int main(int argc, char *argv[])
-{
+void openDataset(const std::string& datasetPath) {
+    std::ofstream outputFile("outputQuality.csv");
+    outputFile << "File Name,Total PM Used,Lower Bound,Solution Quality,Fitness(Excess CPUxRAM),Elapsed Time(nanoseconds)\n";
 
-    ifstream infile("LowerBounds.txt");
+    for (const auto& folder : fs::directory_iterator(datasetPath)) {
+        if (!fs::is_directory(folder)) continue;
+
+        for (const auto& file : fs::directory_iterator(folder)) {
+            if (!fs::is_regular_file(file)) continue;
+            bool tookToLong=false;
+            for (int runIdx = 0; runIdx < kBenchmarkRuns; ++runIdx) {
+                if (tookToLong) break; // do not run the long one 
+                std::ifstream f(file.path().string());
+                if (!f.is_open()) {
+                    std::cerr << "Error opening the file!" << file.path().string() << '\n';
+                    std::exit(1);
+                }
+
+                const std::string filePath = file.path().string();
+                const bool isCDataset = filePath.find('C') != std::string::npos;
+                Solution solution = initialize(f, isCDataset);
+                const int filePmCount = TOTAL_PM_COUNT;
+                const std::string lbKey = file.path().stem().string();
+                const int lowerBound = PmLowerBounds.count(lbKey) ? PmLowerBounds[lbKey] : filePmCount;
+
+                TOTAL_PM_COUNT = lowerBound;
+                const auto begin = std::chrono::steady_clock::now();
+                unsigned long bestFit = run(solution);
+
+                while (bestFit != 0 && TOTAL_PM_COUNT < filePmCount) {
+                    ++TOTAL_PM_COUNT;
+                    if (solution.size() < static_cast<size_t>(TOTAL_PM_COUNT)) {
+                        solution = initialSolution();
+                    }
+                    bestFit = run(solution);
+                }
+
+                const auto end = std::chrono::steady_clock::now();
+                outputFile << lbKey << ','
+                           << TOTAL_PM_COUNT << ',' << lowerBound << ','
+                           << 100 * (TOTAL_PM_COUNT / static_cast<double>(lowerBound) - 1) << ','
+                           << bestFit << ','
+                           << std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()
+                           << '\n';
+                outputFile.flush();
+                if(std::chrono::duration_cast<std::chrono::seconds>(end - begin).count() > 120)
+                    tookToLong=true;
+            }
+        }
+    }
+}
+
+int main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
+
+    std::ifstream infile("LowerBounds.txt");
     if (!infile.is_open()) {
-        cerr << "Error opening LowerBounds.txt" << endl;
+        std::cerr << "Error opening LowerBounds.txt\n";
         return 1;
     }
-    
-    initializeLowerBounds(infile);
-    //openDataset(string(argv[1]),100);
-    openDataset("./dataset/Instances/");
 
+    initializeLowerBounds(infile);
+    openDataset("./dataset/Instances/");
     return 0;
 }
