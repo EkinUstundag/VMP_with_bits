@@ -36,8 +36,8 @@ namespace {
 
 constexpr int kBenchmarkRuns = 10;
 constexpr float kSwapProbability = 0.0f;
-constexpr float kMoveProbability = 0.99f;
-constexpr int kMoveCandidates = 24;//24
+constexpr float kMoveProbability = 1.0f;
+constexpr int kMoveCandidates = 50;//24
 constexpr int kStallLimit = 3000;
 const auto kSearchDuration = std::chrono::seconds(5);
 
@@ -193,10 +193,11 @@ MoveCandidate findBestMoveCandidate(
     bool swap,
     uniform_int_distribution<>& destDist) {
     MoveCandidate best;
+    /*
     for (int c = 0; c < kMoveCandidates; ++c) {
         const int dst = destDist(gen);
-        if (dst == src) continue;
-
+        if (dst == src) {c--; continue;} 
+**/ for (int dst:state.underloaded) {
         int partnerVm = -1;
         int newCpuSrc, newRamSrc, newCpuDst, newRamDst;
 
@@ -248,26 +249,41 @@ bool runElimination(LocalSearchState& state, mt19937& gen) {
         return false;
     }
 
-    bool anyMoved = false;
+    //bool anyMoved = false;
     const std::vector<int> sources = state.overloaded;
+    const int totalChunks = (TOTAL_VM_COUNT + CONTAINER_SIZE - 1) / CONTAINER_SIZE;
+    VmPlacement eliminatedVMs(totalChunks, 0UL);
     for (int src : sources) {
+        //uniform_int_distribution<> ulDist(0, static_cast<int>(state.underloaded.size()) - 1);
+        //const int dst = state.underloaded[ulDist(gen)];
+        //if (dst == src) continue;
+        //moveBit(state.solution[src], state.solution[dst], vm);
+        //anyMoved = true;        
         const int vm = randomVmOnPm(state.solution[src], gen);
         if (vm < 0) continue;
+        const int chunk = vm / CONTAINER_SIZE;
+        unsigned long mask = 1UL << (vm % CONTAINER_SIZE);
 
-        uniform_int_distribution<> ulDist(0, static_cast<int>(state.underloaded.size()) - 1);
-        const int dst = state.underloaded[ulDist(gen)];
-        if (dst == src) continue;
+        state.solution[src][chunk] &= ~mask;
+        eliminatedVMs[chunk] |= mask;
+    }
+    state.syncFromSolution();
+    uniform_int_distribution<> dist(0, state.pmCount - 1);
+    forEachVmOnPm(eliminatedVMs, [&](int vmId) {
+        const int src = dist(gen);
+        if (vmId < 0) return;
+        const int chunk = vmId / CONTAINER_SIZE;
+        unsigned long mask2 = 1UL << (vmId % CONTAINER_SIZE);
+        eliminatedVMs[chunk] &= mask2;
+        state.solution[src][chunk] |= mask2;
+    });
+    
 
-        moveBit(state.solution[src], state.solution[dst], vm);
-        anyMoved = true;
-    }
-    if (anyMoved) {
-        state.syncFromSolution();
-    }
-    return anyMoved;
+    return true;
 }
 
 bool runGuidedStep(LocalSearchState& state, mt19937& gen, bool swap, uniform_int_distribution<>& destDist) {
+    state.syncFromSolution();
     const int src = pickSourcePm(state, gen);
     const int vm = randomVmOnPm(state.solution[src], gen);
     if (vm < 0) return false;
@@ -387,6 +403,12 @@ void printPM(const VmPlacement& pm) {
         std::cout << std::bitset<CONTAINER_SIZE>(n) << ' ';
     }
     std::cout << '\n';
+}
+
+void printSolution(const Solution& solution) {
+    for (VmPlacement pm : solution) {
+        printPM(pm);
+    }
 }
 
 unsigned long checkSameVM(const VmPlacement& pm1, const VmPlacement& pm2) {
@@ -592,11 +614,13 @@ unsigned long run(Solution& solution) {
 
         const bool swap = roll < kSwapProbability;
         if (!runGuidedStep(state, gen, swap, destDist)) {
-            ++stalls;
+            if (!runElimination(state, gen)) ++stalls;
+            else stalls = 0;
         } else {
             stalls = 0;
         }
     }
+
 
     return state.totalFitness;
 }
@@ -635,8 +659,7 @@ void openDataset(const std::string& datasetPath) {
         for (const auto& file : fs::directory_iterator(folder)) {
             if (!fs::is_regular_file(file)) continue;
             bool tookToLong=false;
-            for (int runIdx = 0; runIdx < kBenchmarkRuns; ++runIdx) {
-                if (tookToLong) break; // do not run the long one 
+            for (int runIdx = 0; runIdx < kBenchmarkRuns; ++runIdx) { 
                 std::ifstream f(file.path().string());
                 if (!f.is_open()) {
                     std::cerr << "Error opening the file!" << file.path().string() << '\n';
@@ -670,8 +693,6 @@ void openDataset(const std::string& datasetPath) {
                            << std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()
                            << '\n';
                 outputFile.flush();
-                if(std::chrono::duration_cast<std::chrono::seconds>(end - begin).count() > 120)
-                    tookToLong=true;
             }
         }
     }
