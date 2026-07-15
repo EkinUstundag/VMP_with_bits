@@ -49,7 +49,7 @@ VmPlacement removeSpecificVM(const VmPlacement& pm, const VmPlacement& vm);
 // --- I/O and initialization ---
 void readFile(std::ifstream& f);
 void readFileC(std::ifstream& f);
-Solution initialize(std::ifstream& f, bool isCDataset);
+void initialize(std::ifstream& f, bool isCDataset);
 void initializeLowerBounds(std::ifstream& infile);
 
 // --- Local search operators ---

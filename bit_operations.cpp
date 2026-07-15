@@ -29,15 +29,16 @@ int* vm_CPU_Req = nullptr;
 int* vm_RAM_Req = nullptr;
 int* pm_CPU = nullptr;
 int* pm_RAM = nullptr;
+
 std::string instanceName;
 std::map<std::string, int> PmLowerBounds;
 
 namespace {
 
-constexpr int kBenchmarkRuns = 10;
+constexpr int kBenchmarkRuns = 1;//10
 constexpr float kSwapProbability = 0.0f;
-constexpr float kMoveProbability = 1.0f;
-constexpr int kMoveCandidates = 50;//24
+constexpr float kMoveProbability = 0.9f;
+//constexpr int kMoveCandidates = 50;//24 // not used
 constexpr int kStallLimit = 3000;
 const auto kSearchDuration = std::chrono::seconds(5);
 
@@ -72,10 +73,9 @@ void forEachVmOnPm(const VmPlacement& pm, const std::function<void(int vmId)>& f
 }
 
 // --- Fitness ---
-
 unsigned long overloadFitness(int cpuExcess, int ramExcess) {
-    const int cpuPenalty = (cpuExcess > 0 ? cpuExcess : 0);
-    const int ramPenalty = (ramExcess > 0 ? ramExcess : 0);
+    const long cpuPenalty = (cpuExcess > 0 ? cpuExcess : 0);
+    const long ramPenalty = (ramExcess > 0 ? ramExcess : 0);
     if (cpuPenalty == 0) return static_cast<unsigned long>(ramPenalty);
     if (ramPenalty == 0) return static_cast<unsigned long>(cpuPenalty);
     return static_cast<unsigned long>(cpuPenalty * ramPenalty);
@@ -94,7 +94,20 @@ void pmResourceUsage(const VmPlacement& pm, int& cpu, int& ram) {
     });
 }
 
+long fitnessOfSolution(Solution& solution){
+    unsigned long fitness =0;
+    for (int i=0;i< solution.size();i++) {
+        int cpuUsage=0;
+        int ramUsage=0;
+        pmResourceUsage(solution[i], cpuUsage, ramUsage);
+        fitness += pmFitnessValue(cpuUsage, ramUsage, i);
+    }
+    return fitness;
+}
+
+//PM üzerinden rastgele active bir VM seç
 int randomVmOnPm(const VmPlacement& pm, mt19937& gen) {
+
     const int vmCount = static_cast<int>(countVectorVMs(pm));
     if (vmCount == 0) return -1;
 
@@ -102,6 +115,7 @@ int randomVmOnPm(const VmPlacement& pm, mt19937& gen) {
     const int target = pick(gen);
     int seen = 0;
     int chosen = -1;
+
     forEachVmOnPm(pm, [&](int vmId) {
         if (seen == target) chosen = vmId;
         ++seen;
@@ -196,8 +210,8 @@ MoveCandidate findBestMoveCandidate(
     /*
     for (int c = 0; c < kMoveCandidates; ++c) {
         const int dst = destDist(gen);
-        if (dst == src) {c--; continue;} 
-**/ for (int dst:state.underloaded) {
+        if (dst == src) {c--; continue;}**/
+        for (int dst:state.underloaded) {
         int partnerVm = -1;
         int newCpuSrc, newRamSrc, newCpuDst, newRamDst;
 
@@ -258,7 +272,7 @@ bool runElimination(LocalSearchState& state, mt19937& gen) {
         //const int dst = state.underloaded[ulDist(gen)];
         //if (dst == src) continue;
         //moveBit(state.solution[src], state.solution[dst], vm);
-        //anyMoved = true;        
+        //anyMoved = true;
         const int vm = randomVmOnPm(state.solution[src], gen);
         if (vm < 0) continue;
         const int chunk = vm / CONTAINER_SIZE;
@@ -269,15 +283,19 @@ bool runElimination(LocalSearchState& state, mt19937& gen) {
     }
     state.syncFromSolution();
     uniform_int_distribution<> dist(0, state.pmCount - 1);
+
+    //check eliminatedVM count
+
+
     forEachVmOnPm(eliminatedVMs, [&](int vmId) {
         const int src = dist(gen);
         if (vmId < 0) return;
         const int chunk = vmId / CONTAINER_SIZE;
         unsigned long mask2 = 1UL << (vmId % CONTAINER_SIZE);
-        eliminatedVMs[chunk] &= mask2;
+        //eliminatedVMs[chunk] &= ~mask2;
         state.solution[src][chunk] |= mask2;
     });
-    
+    state.syncFromSolution();
 
     return true;
 }
@@ -498,13 +516,14 @@ void readFileC(std::ifstream& f) {
     vm_RAM_Req = new int[TOTAL_VM_COUNT];
     pm_CPU = new int[TOTAL_PM_COUNT];
     pm_RAM = new int[TOTAL_PM_COUNT];
-    for (int j = 0; j < pmType1Count; ++j) {
-        pm_CPU[j] = cpu_cap;
-        pm_RAM[j] = ram_cap;
-    }
-    for (int j = pmType1Count; j < TOTAL_PM_COUNT; ++j) {
+
+    for (int j = 0; j < pmType2Count; ++j) {
         pm_CPU[j] = cpu_cap2;
         pm_RAM[j] = ram_cap2;
+    }
+    for (int j = pmType2Count; j < TOTAL_PM_COUNT; ++j) {
+        pm_CPU[j] = cpu_cap;
+        pm_RAM[j] = ram_cap;
     }
 
     int vmId = 0;
@@ -545,9 +564,12 @@ Solution initialSolution() {
         });
 
         int assignedPm = -1;
+        unsigned long assignedFit =ULONG_MAX;
         for (int pmIdx : pmOrder) {
-            if (overloadFitness(pmCpu[pmIdx], pmRam[pmIdx]) >= vmFit) {
+            unsigned long pmFit = overloadFitness(pmCpu[pmIdx], pmRam[pmIdx]);
+            if (pmFit >= vmFit && pmFit < assignedFit) {
                 assignedPm = pmIdx;
+                assignedFit = pmFit;
                 break;
             }
         }
@@ -565,13 +587,12 @@ Solution initialSolution() {
     return solution;
 }
 
-Solution initialize(std::ifstream& f, bool isCDataset) {
+void initialize(std::ifstream& f, bool isCDataset) {
     if (isCDataset) {
         readFileC(f);
     } else {
         readFile(f);
     }
-    return initialSolution();
 }
 
 void moveBit(VmPlacement& source, VmPlacement& dest, int vmId) {
@@ -601,8 +622,8 @@ unsigned long run(Solution& solution) {
 
     int stalls = 0;
     const auto start = std::chrono::steady_clock::now();
-
-    while ((std::chrono::steady_clock::now() - start) < kSearchDuration &&
+//(std::chrono::steady_clock::now() - start) < kSearchDuration &&
+    while (
            state.totalFitness > 0 && stalls < kStallLimit) {
         const double roll = scenarioDist(gen);
 
@@ -611,17 +632,24 @@ unsigned long run(Solution& solution) {
             else stalls = 0;
             continue;
         }
+        else {
+            const bool swap = roll < kSwapProbability;
+            if (!runGuidedStep(state, gen, swap, destDist)) {
 
-        const bool swap = roll < kSwapProbability;
-        if (!runGuidedStep(state, gen, swap, destDist)) {
-            if (!runElimination(state, gen)) ++stalls;
-            else stalls = 0;
-        } else {
-            stalls = 0;
+                if (!runElimination(state, gen)) ++stalls;
+                else stalls = 0;
+                //++stalls;
+            } else {
+                stalls = 0;
+            }
         }
+
+        state.syncFromSolution();
     }
 
-
+    //state.syncFromSolution();
+    //std::cout<< "Fitness of solution at the end of run(): "<< fitnessOfSolution(solution)<<'\n';
+    //std::cout<< "Fitness of state.solution at the end of run(): "<< fitnessOfSolution(state.solution)<<'\n';
     return state.totalFitness;
 }
 
@@ -651,7 +679,8 @@ void initializeLowerBounds(std::ifstream& infile) {
 
 void openDataset(const std::string& datasetPath) {
     std::ofstream outputFile("outputQuality.csv");
-    outputFile << "File Name,Total PM Used,Lower Bound,Solution Quality,Fitness(Excess CPUxRAM),Elapsed Time(nanoseconds)\n";
+    outputFile << "kSwapProbability: "<<kSwapProbability << ", kMoveProbability: "<< kMoveProbability<<"\n";
+    outputFile << "File Name,Total PM Used,Lower Bound,Solution Quality,Fitness(Excess CPUxRAM),Fitness Test,Elapsed Time(nanoseconds)\n";
 
     for (const auto& folder : fs::directory_iterator(datasetPath)) {
         if (!fs::is_directory(folder)) continue;
@@ -659,7 +688,7 @@ void openDataset(const std::string& datasetPath) {
         for (const auto& file : fs::directory_iterator(folder)) {
             if (!fs::is_regular_file(file)) continue;
             bool tookToLong=false;
-            for (int runIdx = 0; runIdx < kBenchmarkRuns; ++runIdx) { 
+            for (int runIdx = 0; runIdx < kBenchmarkRuns; ++runIdx) {
                 std::ifstream f(file.path().string());
                 if (!f.is_open()) {
                     std::cerr << "Error opening the file!" << file.path().string() << '\n';
@@ -668,13 +697,15 @@ void openDataset(const std::string& datasetPath) {
 
                 const std::string filePath = file.path().string();
                 const bool isCDataset = filePath.find('C') != std::string::npos;
-                Solution solution = initialize(f, isCDataset);
+                initialize(f, isCDataset);
                 const int filePmCount = TOTAL_PM_COUNT;
                 const std::string lbKey = file.path().stem().string();
                 const int lowerBound = PmLowerBounds.count(lbKey) ? PmLowerBounds[lbKey] : filePmCount;
 
                 TOTAL_PM_COUNT = lowerBound;
+                Solution solution = initialSolution();
                 const auto begin = std::chrono::steady_clock::now();
+
                 unsigned long bestFit = run(solution);
 
                 while (bestFit != 0 && TOTAL_PM_COUNT < filePmCount) {
@@ -687,20 +718,24 @@ void openDataset(const std::string& datasetPath) {
 
                 const auto end = std::chrono::steady_clock::now();
                 outputFile << lbKey << ','
-                           << TOTAL_PM_COUNT << ',' << lowerBound << ','
-                           << 100 * (TOTAL_PM_COUNT / static_cast<double>(lowerBound) - 1) << ','
+                           << solution.size() << ',' << lowerBound << ','
+                           << 100 * (solution.size() / static_cast<double>(lowerBound) - 1) << ','
                            << bestFit << ','
+                           << fitnessOfSolution(solution) << ','
                            << std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()
                            << '\n';
                 outputFile.flush();
+                //std::cout<< "Fitness from run(): "<< bestFit <<'\n';
+                //std::cout<< "Final Fitness: "<< fitnessOfSolution(solution)<<'\n';
             }
         }
     }
 }
 
 int main(int argc, char* argv[]) {
-    (void)argc;
-    (void)argv;
+    //(void)argc;
+    //(void)argv;
+
 
     std::ifstream infile("LowerBounds.txt");
     if (!infile.is_open()) {
@@ -710,5 +745,7 @@ int main(int argc, char* argv[]) {
 
     initializeLowerBounds(infile);
     openDataset("./dataset/Instances/");
+
+
     return 0;
 }
