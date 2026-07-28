@@ -30,7 +30,8 @@
 //      (fresh bins, fresh 5s budget). Repeat until a k succeeds.
 //
 // Compile: g++ -std=c++17 -O2 vmp_solver.cpp -o vmp_solver
-// Run:     ./vmp_solver VMP_A100.vmp LowerBounds.txt
+// Run Single: ./vmp_solver VMP_A100.vmp LowerBounds.txt
+// Run Batch:  ./vmp_solver "dataset\Instances" LowerBounds.txt vmp_results
 
 #include <bits/stdc++.h>
 #include <filesystem>
@@ -606,13 +607,15 @@ int runBatch(const string& rootDir, const string& lowerBoundsPath, const string&
 /* saves every result to their own file */
         string resultPath = (filesystem::path(outputDir) / (inst.name + "_result.txt")).string();
         writeInstanceResult(resultPath, res);
-
     }
-
+/*
     cout << "=== BATCH DONE: " << doneCount << " instance(s) processed, "
          << optimalCount << " optimal, " << failCount << " failed ===\n";
     cout << "Summary written to " << summaryPath << "\n";
     cout << "Per-instance results written to " << outputDir << "\n";
+*/
+
+
 
     return 0;
 }
