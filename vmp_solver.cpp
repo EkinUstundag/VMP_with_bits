@@ -582,7 +582,7 @@ int runBatch(const string& rootDir, const string& lowerBoundsPath, const string&
 
         cout << "[" << doneCount << "/" << files.size() << "] " << inst.name
                 << " (lower bound " << lb << ", " << inst.vmCount << " VMs)\n";
-        for(int denemeSayi=0; denemeSayi < 10;++denemeSayi){
+        //for(int denemeSayi=0; denemeSayi < 10;++denemeSayi){
             SolveResult res = solveInstance(inst, lb, timeLimitSeconds, maxAttempts, /*verbose=*/true);
     
             if (!res.success) {
@@ -602,11 +602,11 @@ int runBatch(const string& rootDir, const string& lowerBoundsPath, const string&
                      << (res.pmsUsed - lb) << "," << (optimal ? "yes" : "no") << ","
                      << res.totalTimeSeconds << "\n";
             summary.flush();
-        }
-/*
+        //}
+/* saves every result to their own file */
         string resultPath = (filesystem::path(outputDir) / (inst.name + "_result.txt")).string();
         writeInstanceResult(resultPath, res);
-*/
+
     }
 
     cout << "=== BATCH DONE: " << doneCount << " instance(s) processed, "
